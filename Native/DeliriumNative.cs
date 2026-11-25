@@ -129,6 +129,8 @@ namespace Delirium
         /// <summary>The head's capsule `raise` further from its joint (host units, along the joint to the capsule's centre: up the neck) and `grow` times as thick: a skull taller than the game man's sticks out of the fitted head, which sits at the jaw (0.05 and 1.08 suit a tall one). Agents made after it take it.</summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_build_set_head(IntPtr b, float raise, float grow);
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_build_set_part_radius(IntPtr b, int i, float radius);
         /// <summary>The Playroom's Custom body: the game man (`build` as nm_build_load gives it) with his legs, arms, trunk height, width (shoulders, hips and thickness), head and neck (nm_build_fit_neck) each that many times his, weighing `kg`; `height` (m) over 0: all of it grown or shrunk to that. His sizes: 1, 1, 1, 1, 1, 1, 77, 0 (close to him, not bit for bit; use `build` itself for him). The Brawler (nm_build_named): 0.45, 0.7, 1, 1.4, 1.5, 1, 80, 0. A new build; free it.</summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr nm_build_sized(IntPtr build, float legs, float arms, float trunk, float width, float head, float neck, float kg, float height);
@@ -189,6 +191,8 @@ namespace Delirium
         /// <summary>Part `i`'s capsule frame (world; the capsule runs along its local Y).</summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_get_part_transform(IntPtr a, int i, float[] pos, float[] rot);
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_part_local_point(IntPtr a, int i, float[] world_point, float[] out_local);
         /// <summary>Every part's frame: 7 floats each (x, y, z, qx, qy, qz, qw) into `out` (room for `parts` of them).</summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_get_part_transforms(IntPtr a, float[] @out, int parts);
@@ -594,6 +598,30 @@ namespace Delirium
         /// <summary>Your animation's pose as the incoming pose (nm_agent_set_incoming_transforms, which nm_agent_follow aims at): `now` each bone's world frame, 7 floats as in nm_rig_create. Call it each frame while the animation plays under the ragdoll; null clears it.</summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_rig_incoming(IntPtr r, IntPtr a, float[] now);
+
+        /// <summary>Number of muscle effectors on this agent (typically 20 for a 21-part humanoid), or 0 if no character is active.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_effector_count(IntPtr a);
+
+        /// <summary>Playroom-style joint name for effector `j` (e.g. "hip_left", "spine_0").</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_effector_name(IntPtr a, int j, byte[] buf, int len);
+
+        /// <summary>Live Playroom Joint Inspector data: actual[3], desired[3], limits[6], stats[4], parts[2]. Returns 3 (ball), 1 (hinge), 0 (none), &lt;0 error.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_get_effector(IntPtr a, int j, float[] actual, float[] desired, float[] limits, float[] stats, int[] parts);
+
+        /// <summary>Batch-reads all muscle effectors in a single FFI call for 60 Hz Playroom lockstep sync and dual logging.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_get_all_effectors(IntPtr a, float[] actual, float[] desired, float[] stats, int[] dofs, int max_count);
+
+        /// <summary>Bitmask of all parts currently in contact (bit k = part k contact != 0).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint nm_agent_contact_mask(IntPtr a);
+
+        /// <summary>Creates an agent from exact initial part frames (parts * 7 floats: x,y,z,qx,qy,qz,qw in NM space) for bit-for-bit Playroom parity.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr nm_agent_create_exact(IntPtr b, float[] frames, int parts, float yaw, float seed);
 
         /// <summary>A string out of a buffer call (nm_*_name, nm_last_error...).</summary>
         public static string Str(Func<byte[], int, int> call)

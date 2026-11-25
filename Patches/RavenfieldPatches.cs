@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
 using DeliriumRavenfield.Core;
+using DeliriumRavenfield.TestArena;
 using HarmonyLib;
+using MapEditor;
 using UnityEngine;
+using static Delirium.Native;
 
 namespace DeliriumRavenfield.Patches
 {
@@ -11,7 +14,7 @@ namespace DeliriumRavenfield.Patches
         private static readonly Dictionary<Actor, float> nearMissCooldown = new Dictionary<Actor, float>();
         [ThreadStatic] private static Actor damageInProgressActor;
 
-        // 1. Actor.Damage -> live shot stagger, melee/kick, explosion, vehicle ram, fall damage, or fatal reaction
+        // 1. Actor.Damage -> locational health override + live stagger, melee/kick, explosion, vehicle ram, fall, or fatal reaction
         [HarmonyPatch(typeof(Actor), nameof(Actor.Damage))]
         private static class Patch_Actor_Damage
         {
@@ -21,24 +24,168 @@ namespace DeliriumRavenfield.Patches
                 public float PrevHealth;
                 public bool WasFallen;
                 public Actor PrevInProgress;
+                public bool UsedLocational;
+                public float RawHealthDamage;
+                public BodyHealthState HealthState;
+                public HitOutcome Outcome;
             }
 
-            private static void Prefix(Actor __instance, out DamagePreState __state)
+            private static void Prefix(Actor __instance, ref DamageInfo info, out DamagePreState __state)
             {
                 __state = new DamagePreState
                 {
                     WasDead = __instance != null && __instance.dead,
                     PrevHealth = __instance != null ? __instance.health : 0f,
                     WasFallen = __instance != null && __instance.fallenOver,
-                    PrevInProgress = damageInProgressActor
+                    PrevInProgress = damageInProgressActor,
+                    UsedLocational = false,
+                    RawHealthDamage = info.healthDamage
                 };
                 damageInProgressActor = __instance;
+
+                if (__instance == null || __instance.dead || Plugin.LodManager == null || Plugin.ConfigInstance == null)
+                    return;
+                if (!Plugin.ConfigInstance.Enabled.Value || !Plugin.ConfigInstance.EnableLocationalHealth.Value)
+                    return;
+                if (LodManager.IsAllowingBleedoutKill)
+                    return;
+
+                // Only AI bots (not player, not seated in vehicles)
+                bool isPlayer = ActorManager.instance != null && __instance == ActorManager.instance.player;
+                if (isPlayer || __instance.IsSeated())
+                    return;
+
+                bool isBulletOrMelee =
+                    info.type == DamageInfo.DamageSourceType.Projectile ||
+                    info.type == DamageInfo.DamageSourceType.ProjectileShatter ||
+                    info.type == DamageInfo.DamageSourceType.Melee ||
+                    info.isKick;
+                if (!isBulletOrMelee)
+                    return;
+
+                // Skip splash damage so explosions / fragmentation keep normal lethal area logic
+                if (info.isSplashDamage)
+                    return;
+
+                var hs = Plugin.LodManager.GetOrCreateHealthState(__instance);
+                if (hs == null) return;
+
+                Vector3 hitPt = info.point != Vector3.zero ? info.point : __instance.CenterPosition();
+                int part;
+                bool isSyncedLockstep = false;
+                if (Plugin.LodManager.TryGetController(__instance, out var existingCtrl) && existingCtrl.IsSimulating && existingCtrl.Agent != IntPtr.Zero)
+                {
+                    isSyncedLockstep = existingCtrl.IsSyncLockstepControlled && Plugin.PlayroomSync != null && Plugin.PlayroomSync.IsConnected;
+                    Vector3 queryPt = isSyncedLockstep ? (hitPt - existingCtrl.SyncVisualOffset) : hitPt;
+                    part = nm_agent_nearest_part(existingCtrl.Agent, ToNmVec(queryPt));
+                    if (part < 0 || part >= 21) part = 10;
+                    if (info.isCriticalHit) part = 12;
+                }
+                else
+                {
+                    part = BodyHealthState.EstimatePartWithoutDelirium(__instance, hitPt, info.isCriticalHit);
+                }
+
+                BodyZone zone = BodyHealthState.ClassifyZone(__instance, part, hitPt, info.isCriticalHit);
+                Vector3 hitNrm = info.direction.sqrMagnitude > 1e-4f ? -info.direction.normalized : __instance.transform.forward;
+                float rawDmg = Mathf.Max(info.healthDamage, 1f);
+
+                HitOutcome outcome = hs.ApplyHit(zone, part, rawDmg, hitPt, hitNrm, info.sourceActor);
+                __state.UsedLocational = true;
+                __state.HealthState = hs;
+                __state.Outcome = outcome;
+
+                if (isSyncedLockstep)
+                {
+                    // Keep the synced test subject alive in Ravenfield's match state so vanilla despawn/respawn timers
+                    // never destroy it while we test shots/headshots/wounds live alongside Playroom!
+                    info.healthDamage = 0f;
+                    info.balanceDamage = 0f;
+                    info.isCriticalHit = false;
+                }
+                else if (outcome.Lethal)
+                {
+                    // Ensure Ravenfield cleanly registers kill credit for headshots, heart hits, and chest destruction
+                    info.healthDamage = Mathf.Max(info.healthDamage, __instance.health + 50f);
+                    if (outcome.InstantHeadshot)
+                        info.isCriticalHit = true;
+                }
+                else
+                {
+                    // Prevent vanilla Actor.Damage from prematurely killing or forcing vanilla FallOver on non-lethal limb/stomach hits
+                    float targetFloor = Mathf.Max(5f, (outcome.BloodRemaining / 100f) * __instance.maxHealth);
+                    float maxAllowedDmg = Mathf.Max(0f, __instance.health - targetFloor);
+                    info.healthDamage = Mathf.Min(info.healthDamage, maxAllowedDmg);
+                    info.balanceDamage = 0f;
+                    info.isCriticalHit = false;
+                }
             }
 
             private static void Postfix(Actor __instance, DamageInfo info, bool __result, DamagePreState __state)
             {
                 damageInProgressActor = __state.PrevInProgress;
-                if (!__result || __instance == null || Plugin.LodManager == null || !Plugin.ConfigInstance.Enabled.Value)
+                if (__instance == null || Plugin.LodManager == null || !Plugin.ConfigInstance.Enabled.Value)
+                    return;
+
+                // Handle hits on DyingStagger, DeadSimulating, and DeadFrozen actors BEFORE checking __result
+                if (__state.WasDead)
+                {
+                    if (!Plugin.ConfigInstance.EnableCorpseShootAndWake.Value) return;
+                    var deadCtrl = Plugin.LodManager.TryAcquireOrWakeCorpse(__instance);
+                    if (deadCtrl == null) return;
+
+                    if (info.type == DamageInfo.DamageSourceType.Explosion || info.type == DamageInfo.DamageSourceType.StickyExplosive)
+                    {
+                        float rawF = info.impactForce.magnitude > 1f ? info.impactForce.magnitude : (info.healthDamage * 4f);
+                        deadCtrl.ApplyExplosion(info.point != Vector3.zero ? info.point : __instance.CenterPosition(), 6f, rawF, fatal: true, isAlreadyNormalizedSpeed: false);
+                    }
+                    else if (info.type == DamageInfo.DamageSourceType.Melee || info.isKick)
+                    {
+                        deadCtrl.ApplyMelee(info, fatal: true);
+                    }
+                    else
+                    {
+                        bool isAlreadyCorpse = deadCtrl.Phase != RagdollPhase.DyingStagger;
+                        deadCtrl.ApplyShot(info, fatal: true, alreadyDeadCorpse: isAlreadyCorpse);
+                    }
+                    return;
+                }
+
+                // Locational health hit routing (fires even if clamped healthDamage was 0!)
+                if (__state.UsedLocational && __state.HealthState != null)
+                {
+                    // Restore raw damage on local copy for accurate impulse normalization
+                    DamageInfo rawInfo = info;
+                    rawInfo.healthDamage = __state.RawHealthDamage;
+
+                    if (__state.Outcome.Lethal || __instance.dead)
+                    {
+                        var ctrl = Plugin.LodManager.TryAcquireForFallOrDeath(__instance);
+                        if (ctrl != null)
+                        {
+                            ctrl.HealthState = __state.HealthState;
+                            ctrl.ApplyLocationalShot(rawInfo, __state.Outcome, __state.HealthState);
+                        }
+                        return;
+                    }
+
+                    // Non-lethal locational wound inside LOD range -> acquire Delirium and drive wounded/hop/crawl/clutch/surrender
+                    var liveCtrl = Plugin.LodManager.TryAcquireForWounded(__instance);
+                    if (liveCtrl != null)
+                    {
+                        liveCtrl.HealthState = __state.HealthState;
+                        liveCtrl.ApplyLocationalShot(rawInfo, __state.Outcome, __state.HealthState);
+                    }
+                    else if (__state.HealthState.RightArmRuined)
+                    {
+                        // Even outside Delirium LOD range, gun-arm ruined bots drop their weapon & stop shooting
+                        var fallback = new WoundedCombatController(__instance, Plugin.ConfigInstance);
+                        fallback.HandleSurrenderSetup(__state.HealthState);
+                    }
+                    return;
+                }
+
+                if (!__result)
                     return;
 
                 bool becameDead = !__state.WasDead && __instance.dead;
@@ -46,27 +193,19 @@ namespace DeliriumRavenfield.Patches
 
                 if (becameDead)
                 {
+                    if (LodManager.IsAllowingBleedoutKill)
+                    {
+                        // Handled directly by LodManager.KillActorFromBleedout -> ApplyBleedoutDeath
+                        return;
+                    }
                     var ctrl = Plugin.LodManager.TryAcquireForFallOrDeath(__instance);
                     ctrl?.ApplyDeath(info);
                     return;
                 }
 
-                // Already dead corpse taking extra bullets/explosions
-                if (__state.WasDead)
-                {
-                    if (Plugin.LodManager.TryGetController(__instance, out var deadCtrl) && deadCtrl.IsSimulating)
-                    {
-                        if (info.type == DamageInfo.DamageSourceType.Explosion || info.type == DamageInfo.DamageSourceType.StickyExplosive)
-                            deadCtrl.ApplyExplosion(info.point != Vector3.zero ? info.point : __instance.CenterPosition(), 6f, info.impactForce.magnitude, fatal: true, isAlreadyNormalizedSpeed: false);
-                        else
-                            deadCtrl.ApplyShot(info, fatal: true, alreadyDeadCorpse: true);
-                    }
-                    return;
-                }
-
                 if (!isAlive) return;
 
-                // Alive reactions by damage source type
+                // Alive reactions by damage source type (Player, Explosions, FallDamage, or when LocationalHealth is disabled)
                 if (info.type == DamageInfo.DamageSourceType.Explosion || info.type == DamageInfo.DamageSourceType.StickyExplosive)
                 {
                     var ctrl = Plugin.LodManager.TryAcquireForFallOrDeath(__instance);
@@ -102,8 +241,25 @@ namespace DeliriumRavenfield.Patches
             }
         }
 
+        // 1b. Actor.ResupplyHealth -> Medipack stops bleeding & restores blood
+        [HarmonyPatch(typeof(Actor), nameof(Actor.ResupplyHealth))]
+        private static class Patch_Actor_ResupplyHealth
+        {
+            private static void Postfix(Actor __instance, bool __result)
+            {
+                if (!__result || __instance == null || Plugin.LodManager == null || Plugin.ConfigInstance == null)
+                    return;
+                if (!Plugin.ConfigInstance.EnableLocationalHealth.Value || !Plugin.ConfigInstance.EnableMedkitStopBleed.Value)
+                    return;
+
+                if (Plugin.LodManager.TryGetHealthState(__instance, out var hs))
+                {
+                    hs.OnHealed(35f);
+                }
+            }
+        }
+
         // 2. Actor.FallOver & Actor.KnockOver -> route non-dead knockdowns through Delirium
-        //    Skipped while inside Actor.Damage so we never double-apply KnockOver + Shot impulses in one hit!
         [HarmonyPatch(typeof(Actor), nameof(Actor.FallOver))]
         private static class Patch_Actor_FallOver
         {
@@ -136,6 +292,7 @@ namespace DeliriumRavenfield.Patches
             private static void Postfix(Actor __instance, DamageInfo info, bool isSilentKill)
             {
                 if (__instance == null || __instance == damageInProgressActor || isSilentKill || Plugin.LodManager == null || !Plugin.ConfigInstance.Enabled.Value) return;
+                if (LodManager.IsAllowingBleedoutKill) return;
                 if (Plugin.LodManager.TryGetController(__instance, out var existing) && existing.IsDeadOrFrozen) return;
 
                 var ctrl = Plugin.LodManager.TryAcquireForFallOrDeath(__instance);
@@ -143,7 +300,7 @@ namespace DeliriumRavenfield.Patches
             }
         }
 
-        // 4. Suppress vanilla automatic GetUp while Delirium is still simulating active stagger/fall
+        // 4. Suppress vanilla automatic GetUp while Delirium is still simulating active stagger/fall/wounded crawl
         [HarmonyPatch(typeof(Actor), "UpdateRagdollStates")]
         private static class Patch_Actor_UpdateRagdollStates
         {
@@ -154,26 +311,137 @@ namespace DeliriumRavenfield.Patches
             }
         }
 
-        // 5. Pause AI walking & firing while Delirium controls the actor (or when Test Range mode is active)
+        // 4b. Keep getting-up AI bots planted flush on the real floor (ActiveRaggy.SyncAnimatorPosition casts an unmasked
+        // ray that hits the bot's own standing hitboxes/ragdoll colliders, lifting the model ~0.8-1.0m off the ground!)
+        private static void SnapActorToGroundAfterGetUp(Actor actor)
+        {
+            if (actor == null || actor.dead || actor.IsSeated() || actor.IsOnLadder() || actor.immersedInWater) return;
+            if (ActorManager.instance != null && actor == ActorManager.instance.player) return;
+            if (Plugin.Runtime == null || !Plugin.Runtime.IsReady) return;
+
+            if (actor.ragdoll != null && actor.ragdoll.transform != null && actor.ragdoll.transform != actor.transform)
+            {
+                if (actor.ragdoll.transform.localPosition.sqrMagnitude > 1e-4f)
+                {
+                    actor.ragdoll.transform.localPosition = Vector3.zero;
+                    actor.ragdoll.transform.localRotation = Quaternion.identity;
+                }
+            }
+
+            Vector3 pos = actor.transform.position;
+            float groundY = Plugin.Runtime.SampleGroundHeight(pos + Vector3.up * 0.5f, actor.transform, pos.y);
+            float diff = pos.y - groundY;
+            if (Mathf.Abs(diff) > 0.05f && Mathf.Abs(diff) < 4.0f)
+            {
+                Transform ragObjTf = actor.ragdoll != null && actor.ragdoll.ragdollObject != null ? actor.ragdoll.ragdollObject.transform : null;
+                Transform origParent = ragObjTf != null ? ragObjTf.parent : null;
+                bool preserveRag = ragObjTf != null && ragObjTf.gameObject.activeSelf;
+                if (preserveRag) ragObjTf.SetParent(null, true);
+
+                actor.SetPositionAndRotation(new Vector3(pos.x, groundY, pos.z), actor.transform.rotation);
+
+                if (preserveRag) ragObjTf.SetParent(origParent, true);
+            }
+        }
+
+        [HarmonyPatch(typeof(Actor), "UpdateGetup")]
+        private static class Patch_Actor_UpdateGetup
+        {
+            private static void Postfix(Actor __instance)
+            {
+                if (!Plugin.ConfigInstance.Enabled.Value) return;
+                SnapActorToGroundAfterGetUp(__instance);
+            }
+        }
+
+        [HarmonyPatch(typeof(Actor), "FinishGettingUp")]
+        private static class Patch_Actor_FinishGettingUp
+        {
+            private static void Postfix(Actor __instance)
+            {
+                if (!Plugin.ConfigInstance.Enabled.Value) return;
+                SnapActorToGroundAfterGetUp(__instance);
+            }
+        }
+
+        // 5. Pause vanilla AI walking only when Delirium owns ground/stagger/surrender (WoundedStanding uses NavMesh anchor!)
         [HarmonyPatch(typeof(Actor), "UpdateMovement")]
         private static class Patch_Actor_UpdateMovement
         {
             private static bool Prefix(Actor __instance)
             {
                 if (__instance == null || Plugin.LodManager == null) return true;
-                return !Plugin.LodManager.IsSuppressingControl(__instance);
+                return !Plugin.LodManager.IsSuppressingMovement(__instance);
             }
         }
 
+        // Suppress vanilla AI firing while Delirium owns the ragdoll (WoundedCombatController fires controlled one-handed bursts)
         [HarmonyPatch(typeof(Actor), "CanFireWeapon")]
         private static class Patch_Actor_CanFireWeapon
         {
             private static bool Prefix(Actor __instance, ref bool __result)
             {
                 if (__instance == null || Plugin.LodManager == null) return true;
-                if (Plugin.LodManager.IsSuppressingControl(__instance))
+                if (Plugin.LodManager.IsSuppressingWeaponFire(__instance))
                 {
                     __result = false;
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        // Prevent automatic magazine reloads while a bot is wounded, staggering, crawling, or fallen
+        [HarmonyPatch(typeof(Weapon), nameof(Weapon.Reload))]
+        private static class Patch_Weapon_Reload
+        {
+            private static bool Prefix(Weapon __instance)
+            {
+                if (__instance == null || Plugin.LodManager == null || !Plugin.ConfigInstance.Enabled.Value) return true;
+                var user = __instance.user;
+                if (user != null && Plugin.LodManager.IsSuppressingReload(user))
+                {
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        [HarmonyPatch(typeof(Weapon), "AutoReload")]
+        private static class Patch_Weapon_AutoReload
+        {
+            private static bool Prefix(Weapon __instance)
+            {
+                if (__instance == null || Plugin.LodManager == null || !Plugin.ConfigInstance.Enabled.Value) return true;
+                var user = __instance.user;
+                if (user != null && Plugin.LodManager.IsSuppressingReload(user))
+                {
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        // 5a. Briefly defer weapon destruction on sudden death when startled reflex blind-fire triggers
+        [HarmonyPatch(typeof(Actor), nameof(Actor.DropWeapon))]
+        private static class Patch_Actor_DropWeapon
+        {
+            private static bool Prefix(Actor __instance, int slot)
+            {
+                if (ActorRagdollController.IsAllowingDeferredDrop) return true;
+                if (__instance == null || Plugin.LodManager == null || Plugin.ConfigInstance == null) return true;
+                if (!Plugin.ConfigInstance.Enabled.Value || !Plugin.ConfigInstance.EnableBlindFire.Value) return true;
+                if (ActorManager.instance != null && __instance == ActorManager.instance.player) return true;
+                if (!__instance.dead || __instance.IsSeated()) return true;
+                if (slot < 0 || __instance.weapons == null || slot >= __instance.weapons.Length) return true;
+
+                Weapon w = __instance.weapons[slot];
+                if (w == null || w != __instance.activeWeapon) return true;
+                if (!ActorRagdollController.IsEligibleBlindFireWeapon(w)) return true;
+
+                var ctrl = Plugin.LodManager.TryAcquireForFallOrDeath(__instance);
+                if (ctrl != null && ctrl.TryDeferWeaponDropForBlindFire(w, slot))
+                {
                     return false;
                 }
                 return true;
@@ -187,7 +455,6 @@ namespace DeliriumRavenfield.Patches
             private static bool Prefix(ActiveRaggy __instance)
             {
                 if (__instance == null || Plugin.LodManager == null) return true;
-                // If Delirium is already simulating this ragdoll (e.g. bot dies mid-stagger), do NOT reset bones back to animatedTransforms!
                 return !Plugin.LodManager.IsSimulatingRaggy(__instance);
             }
         }
@@ -217,7 +484,16 @@ namespace DeliriumRavenfield.Patches
         [HarmonyPatch(typeof(Actor), nameof(Actor.SpawnAt))]
         private static class Patch_Actor_SpawnAt
         {
-            private static void Prefix(Actor __instance) => Plugin.LodManager?.ReleaseActor(__instance, restoreGame: false);
+            private static void Prefix(Actor __instance)
+            {
+                Plugin.LodManager?.ReleaseActor(__instance, restoreGame: false);
+                Plugin.LodManager?.ResetHealthState(__instance);
+            }
+
+            private static void Postfix(Actor __instance)
+            {
+                Plugin.TestArenaManager?.OnActorSpawned(__instance);
+            }
         }
 
         [HarmonyPatch(typeof(Actor), nameof(Actor.SetModelSkin))]
@@ -235,7 +511,11 @@ namespace DeliriumRavenfield.Patches
         [HarmonyPatch(typeof(Actor), nameof(Actor.Deactivate))]
         private static class Patch_Actor_Deactivate
         {
-            private static void Prefix(Actor __instance) => Plugin.LodManager?.ReleaseActor(__instance, restoreGame: false);
+            private static void Prefix(Actor __instance)
+            {
+                Plugin.LodManager?.ReleaseActor(__instance, restoreGame: false);
+                Plugin.LodManager?.ResetHealthState(__instance);
+            }
         }
 
         // 7. ActorManager.Explode -> unified Delirium blast wave for nearby actors
@@ -259,7 +539,9 @@ namespace DeliriumRavenfield.Patches
                 {
                     var actor = nearby[i];
                     if (actor == null || actor.IsSeated()) continue;
-                    var ctrl = Plugin.LodManager.TryAcquireForFallOrDeath(actor);
+                    var ctrl = actor.dead
+                        ? Plugin.LodManager.TryAcquireOrWakeCorpse(actor)
+                        : Plugin.LodManager.TryAcquireForFallOrDeath(actor);
                     ctrl?.ApplyExplosion(info.point, radius, rawForce, fatal: actor.dead, isAlreadyNormalizedSpeed: false);
                 }
             }
@@ -274,7 +556,6 @@ namespace DeliriumRavenfield.Patches
 
             private static void Postfix(Projectile __instance, Vector3 delta, bool __result)
             {
-                // __result == true means the projectile hit something; only check near-miss while still flying
                 if (__result || __instance == null || Plugin.LodManager == null) return;
                 var cfg = Plugin.ConfigInstance;
                 if (!cfg.Enabled.Value || !cfg.EnableNearMissFlinch.Value) return;
@@ -309,6 +590,9 @@ namespace DeliriumRavenfield.Patches
                         continue;
                     if (projTeam >= 0 && actor.team == projTeam)
                         continue;
+                    // Don't interrupt wounded/crawling/surrendering bots with near-miss stagger takeover
+                    if (Plugin.LodManager.TryGetHealthState(actor, out var hs) && hs.IsWounded)
+                        continue;
 
                     if (nearMissCooldown.TryGetValue(actor, out float nextOk) && now < nextOk)
                         continue;
@@ -326,6 +610,100 @@ namespace DeliriumRavenfield.Patches
                         ctrl?.ApplyNearMiss(start, dir);
                     }
                 }
+            }
+        }
+
+        // 9. Dedicated Test Arena & Playroom Mirror Map Picker injection & virtual MapDescriptor interception
+        [HarmonyPatch(typeof(MapPicker), "GetBuiltInEntries")]
+        private static class Patch_MapPicker_GetBuiltInEntries
+        {
+            private static void Postfix(ref List<IPickerEntryData> __result)
+            {
+                if (__result == null) return;
+                bool hasArena = false;
+                bool hasMirror = false;
+                for (int i = 0; i < __result.Count; i++)
+                {
+                    if (__result[i] is MapEntryData existing)
+                    {
+                        if (TestArenaConstants.IsVirtualTestMapPath(existing.sceneName)) hasArena = true;
+                        if (PlayroomMirrorDefinitions.IsVirtualMirrorMapPath(existing.sceneName)) hasMirror = true;
+                    }
+                }
+                if (!hasArena) __result.Add(TestArenaConstants.CreateMapEntry());
+                if (!hasMirror) __result.Add(PlayroomMirrorDefinitions.CreateMapEntry());
+            }
+        }
+
+        [HarmonyPatch(typeof(MapDescriptor), nameof(MapDescriptor.LoadFile))]
+        private static class Patch_MapDescriptor_LoadFile
+        {
+            private static bool Prefix(string filePath, ref MapDescriptor.ParseResult __result)
+            {
+                if (TestArenaConstants.IsVirtualTestMapPath(filePath))
+                {
+                    __result = new MapDescriptor.ParseResult(null, new TestArenaSceneConstructor());
+                    return false;
+                }
+                if (PlayroomMirrorDefinitions.IsVirtualMirrorMapPath(filePath))
+                {
+                    __result = new MapDescriptor.ParseResult(null, new PlayroomMirrorSceneConstructor());
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        [HarmonyPatch(typeof(MapEntryData), "LoadOrGenerateMetaData")]
+        private static class Patch_MapEntryData_LoadOrGenerateMetaData
+        {
+            private static bool Prefix(MapEntryData __instance, string fullScenePath)
+            {
+                if (__instance != null && (TestArenaConstants.IsVirtualTestMapPath(__instance.sceneName) ||
+                                           TestArenaConstants.IsVirtualTestMapPath(fullScenePath) ||
+                                           PlayroomMirrorDefinitions.IsVirtualMirrorMapPath(__instance.sceneName) ||
+                                           PlayroomMirrorDefinitions.IsVirtualMirrorMapPath(fullScenePath)))
+                {
+                    __instance.hasLoadedMetaData = true;
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        // 10. Stationary Dummy AI Lock (prevents scanning, crouching/proning, squad orders, vehicle boarding, and firing)
+        [HarmonyPatch(typeof(AiActorController), nameof(AiActorController.TickAiCoroutines))]
+        private static class Patch_AiActorController_TickAiCoroutines
+        {
+            private static bool Prefix(AiActorController __instance)
+            {
+                if (__instance == null || __instance.actor == null || Plugin.LodManager == null) return true;
+                return !Plugin.LodManager.IsSuppressingAiBrain(__instance.actor);
+            }
+        }
+
+        [HarmonyPatch(typeof(AiActorController), "UpdateStance")]
+        private static class Patch_AiActorController_UpdateStance
+        {
+            private static bool Prefix(AiActorController __instance)
+            {
+                if (__instance == null || __instance.actor == null || Plugin.LodManager == null) return true;
+                return !Plugin.LodManager.IsSuppressingAiBrain(__instance.actor);
+            }
+        }
+
+        [HarmonyPatch(typeof(AiActorController), nameof(AiActorController.WantsToFire))]
+        private static class Patch_AiActorController_WantsToFire
+        {
+            private static bool Prefix(AiActorController __instance, ref bool __result)
+            {
+                if (__instance == null || __instance.actor == null || Plugin.LodManager == null) return true;
+                if (Plugin.LodManager.IsSuppressingWeaponFire(__instance.actor))
+                {
+                    __result = false;
+                    return false;
+                }
+                return true;
             }
         }
     }

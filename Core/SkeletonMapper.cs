@@ -77,7 +77,7 @@ namespace DeliriumRavenfield.Core
             }
         }
 
-        public RigBuildResult BuildRigForActor(Actor actor, IntPtr baseBuild, float groundY)
+        public RigBuildResult BuildRigForActor(Actor actor, IntPtr baseBuild, float groundY, Vector3? overrideFacing = null)
         {
             if (actor == null || actor.ragdoll == null || actor.ragdoll.ragdollObject == null)
                 return null;
@@ -156,7 +156,7 @@ namespace DeliriumRavenfield.Core
 
             // 3. Extract bind pose from SkinnedMeshRenderers and align upright (fixes Blender Z-up / lying-flat bind poses!)
             var bindMatrices = ExtractBindPoseUpright(
-                actor, renderers, bones, parents, parts, groundY,
+                actor, renderers, bones, parents, parts, groundY, overrideFacing,
                 out float grow, out Vector3 bindHip, out Quaternion alignRot, out Vector3 alignedHipPos, out int knownBindCount);
 
             var restFrames = new float[n * 7];
@@ -253,6 +253,12 @@ namespace DeliriumRavenfield.Core
                 }
             }
 
+            // 7b. Ensure head & limb collision capsules match Ravenfield's chunky low-poly mesh thickness
+            // so hands, forearms, helmet/head, vest, and knees rest ON the floor instead of sinking into it.
+            float scale = nm_build_get_scale(build);
+            if (scale <= 0f) scale = 1f;
+            ApplyVisualSurfaceRadii(build, scale);
+
             // 8. Background adaptive balance tuning cached per skin + preset
             string tuneKey = $"{skinKey}|{preset}|{sizeMode}";
             if (config.AdaptiveTuning.Value)
@@ -260,8 +266,6 @@ namespace DeliriumRavenfield.Core
                 ApplyOrScheduleTune(tuneKey, baseBuild, fitJoints, sizeMode, preset, build);
             }
 
-            float scale = nm_build_get_scale(build);
-            if (scale <= 0f) scale = 1f;
             float finalWeight = nm_build_get_weight(build);
 
             if (loggedSkins.Add(skinKey))
@@ -364,6 +368,9 @@ namespace DeliriumRavenfield.Core
                             temp = r;
                         }
                     }
+                    float tempScale = nm_build_get_scale(temp);
+                    if (tempScale <= 0f) tempScale = 1f;
+                    ApplyVisualSurfaceRadii(temp, tempScale);
                     int score = nm_build_tune(temp, 160);
                     lock (tuneLock)
                     {
@@ -389,6 +396,7 @@ namespace DeliriumRavenfield.Core
             int[] parents,
             int[] parts,
             float groundY,
+            Vector3? overrideFacing,
             out float grow,
             out Vector3 hip,
             out Quaternion alignRot,
@@ -474,6 +482,12 @@ namespace DeliriumRavenfield.Core
             int iThighL = FindPart(1), iThighR = FindPart(4);
             int iArmL = FindPart(14), iArmR = FindPart(18);
 
+            Vector3 resolvedFwd = overrideFacing.HasValue
+                ? Vector3.ProjectOnPlane(overrideFacing.Value, Vector3.up)
+                : (actor != null ? Vector3.ProjectOnPlane(actor.transform.forward, Vector3.up) : Vector3.forward);
+            if (resolvedFwd.sqrMagnitude < 1e-4f) resolvedFwd = Vector3.forward;
+            resolvedFwd.Normalize();
+
             alignRot = Quaternion.identity;
             if (iHead >= 0 && iFootL >= 0 && iFootR >= 0 && (iThighL >= 0 && iThighR >= 0 || iArmL >= 0 && iArmR >= 0))
             {
@@ -489,20 +503,15 @@ namespace DeliriumRavenfield.Core
                 {
                     bindFwd.Normalize();
                     Quaternion bindBasis = Quaternion.LookRotation(bindFwd, bindUp);
-
-                    Vector3 targetFwd = actor != null
-                        ? Vector3.ProjectOnPlane(actor.transform.forward, Vector3.up)
-                        : Vector3.forward;
-                    if (targetFwd.sqrMagnitude < 1e-4f) targetFwd = Vector3.forward;
-                    Quaternion targetBasis = Quaternion.LookRotation(targetFwd.normalized, Vector3.up);
+                    Quaternion targetBasis = Quaternion.LookRotation(resolvedFwd, Vector3.up);
 
                     alignRot = targetBasis * Quaternion.Inverse(bindBasis);
                 }
             }
 
-            // Place the upright-aligned bind pose standing cleanly on groundY (ankle ~0.04m above ground)
-            // horizontally centered at the character's hips so restFrames matches nm_agent_create's standing height
-            // even if the actor was crouching, prone, or already falling at takeover!
+            // Place the upright-aligned bind pose standing cleanly on groundY by measuring the EXACT
+            // lowest boot-sole vertex of the Soldier's readable SkinnedMeshRenderer in bind pose!
+            // This prevents visual boot floating or sinking regardless of where the ankle bone sits inside the boot.
             float lowestFootRelY = -0.85f;
             if (iFootL >= 0 && iFootR >= 0)
             {
@@ -517,8 +526,29 @@ namespace DeliriumRavenfield.Core
                     lowestFootRelY = Mathf.Min(lowestFootRelY, (alignRot * RawPos(b)).y);
             }
 
+            float bootSoleRelY = lowestFootRelY - 0.04f;
+            float minVertRelY = float.MaxValue;
+            foreach (var r in renderers)
+            {
+                if (r == null || r.sharedMesh == null || !r.sharedMesh.isReadable) continue;
+                var verts = r.sharedMesh.vertices;
+                if (verts == null || verts.Length == 0) continue;
+                var l2w = r.transform.localToWorldMatrix;
+                for (int vi = 0; vi < verts.Length; vi++)
+                {
+                    Vector3 vBind = (l2w.MultiplyPoint3x4(verts[vi]) - hipLocal) * gLocal;
+                    float vy = (alignRot * vBind).y;
+                    if (vy < minVertRelY) minVertRelY = vy;
+                }
+            }
+            if (minVertRelY < float.MaxValue)
+            {
+                // Clamp within sane boot thickness around the ankle bone so weird capes/weapons can't skew height
+                bootSoleRelY = Mathf.Clamp(minVertRelY, lowestFootRelY - 0.22f, lowestFootRelY + 0.02f);
+            }
+
             Vector3 currentHip = bones[0].position;
-            alignedHipPos = new Vector3(currentHip.x, groundY + 0.04f - lowestFootRelY, currentHip.z);
+            alignedHipPos = new Vector3(currentHip.x, groundY - bootSoleRelY, currentHip.z);
 
             for (int b = 0; b < bones.Length; b++)
             {
@@ -526,7 +556,154 @@ namespace DeliriumRavenfield.Core
                 Quaternion rot = alignRot * m[b].rotation;
                 m[b] = Matrix4x4.TRS(pos, rot, Vector3.one);
             }
+
+            // Neutralize A-pose / T-pose limbs (e.g., Ravenfield Soldier's 46-deg flared arms & 40-deg bent elbows)
+            // into Homer's exact canonical standing limb directions so:
+            //  1) nm_rig_create records 0-deg neutral arm/leg offsets (visual limbs match Playroom 1:1!)
+            //  2) nm_build_fit starts with ~0-deg shoulder/elbow rest angles (no 34-deg initial joint strain!)
+            //  3) nm_rig_take / nm_rig_incoming map animated standing arms cleanly without inward ribcage twist!
+            NeutralizeBindPoseToStanding(m, parents, parts, resolvedFwd, iFootL, iFootR);
             return m;
+        }
+
+        private static void NeutralizeBindPoseToStanding(
+            Matrix4x4[] m,
+            int[] parents,
+            int[] parts,
+            Vector3 fwd,
+            int iFootL,
+            int iFootR)
+        {
+            int n = m.Length;
+            if (n == 0) return;
+
+            // Unity basis: Cross(Up, Fwd) = Right, -Right = Left
+            Vector3 up = Vector3.up;
+            Vector3 right = Vector3.Cross(up, fwd).normalized;
+            Vector3 left = -right;
+
+            // Exact Homer canonical standing directions (from homer-own.json) expressed in (Left/Right, Fwd, Up):
+            //   Thigh / Shin (1->2, 2->3, 4->5, 5->6) : straight down (-Up)
+            //   UpperArm L/R (14->15, 18->19)         : 17.0 deg out-down (0.293*Side - 0.956*Up)
+            //   Forearm  L/R (15->16, 19->20)         : gentle relaxed hang (0.030*Side + 0.298*Fwd - 0.954*Up)
+            Vector3 wantDown = -up;
+            Vector3 wantUpArmL = (0.293f * left - 0.956f * up).normalized;
+            Vector3 wantUpArmR = (0.293f * right - 0.956f * up).normalized;
+            Vector3 wantLoArmL = (0.030f * left + 0.298f * fwd - 0.954f * up).normalized;
+            Vector3 wantLoArmR = (0.030f * right + 0.298f * fwd - 0.954f * up).normalized;
+
+            float footYBefore = (iFootL >= 0 && iFootR >= 0)
+                ? Mathf.Min(m[iFootL].GetColumn(3).y, m[iFootR].GetColumn(3).y)
+                : 0f;
+
+            // Bones are in topological (parent-before-child) order
+            for (int b = 0; b < n; b++)
+            {
+                int p = parts[b];
+                int childPart;
+                Vector3 wantDir;
+                switch (p)
+                {
+                    case 1:  childPart = 2;  wantDir = wantDown;   break; // Thigh_Left -> Shin_Left
+                    case 2:  childPart = 3;  wantDir = wantDown;   break; // Shin_Left -> Foot_Left
+                    case 4:  childPart = 5;  wantDir = wantDown;   break; // Thigh_Right -> Shin_Right
+                    case 5:  childPart = 6;  wantDir = wantDown;   break; // Shin_Right -> Foot_Right
+                    case 14: childPart = 15; wantDir = wantUpArmL; break; // Upper_Arm_Left -> Lower_Arm_Left
+                    case 15: childPart = 16; wantDir = wantLoArmL; break; // Lower_Arm_Left -> Hand_Left
+                    case 18: childPart = 19; wantDir = wantUpArmR; break; // Upper_Arm_Right -> Lower_Arm_Right
+                    case 19: childPart = 20; wantDir = wantLoArmR; break; // Lower_Arm_Right -> Hand_Right
+                    default: continue;
+                }
+
+                // Find direct or nearest descendant mapped to childPart
+                int childIdx = -1;
+                for (int c = b + 1; c < n; c++)
+                {
+                    if (parts[c] == childPart && IsDescendantOf(parents, c, b))
+                    {
+                        childIdx = c;
+                        break;
+                    }
+                }
+                if (childIdx < 0) continue;
+
+                Vector3 pivot = m[b].GetColumn(3);
+                Vector3 curVec = (Vector3)m[childIdx].GetColumn(3) - pivot;
+                if (curVec.sqrMagnitude < 1e-6f) continue;
+
+                Vector3 curDir = curVec.normalized;
+                float dot = Mathf.Clamp(Vector3.Dot(curDir, wantDir), -1f, 1f);
+                if (dot > 0.9999f) continue; // Already aligned within < 0.8 deg
+
+                Quaternion delta = Quaternion.FromToRotation(curDir, wantDir);
+
+                // Rotate bone b and rigidly propagate delta across all descendants of b around pivot
+                m[b] = Matrix4x4.TRS(pivot, delta * m[b].rotation, Vector3.one);
+                for (int d = b + 1; d < n; d++)
+                {
+                    if (!IsDescendantOf(parents, d, b)) continue;
+                    Vector3 dPos = pivot + delta * ((Vector3)m[d].GetColumn(3) - pivot);
+                    Quaternion dRot = delta * m[d].rotation;
+                    m[d] = Matrix4x4.TRS(dPos, dRot, Vector3.one);
+                }
+            }
+
+            // Preserve exact boot-sole height if straightening knees shifted feet by a couple millimetres
+            if (iFootL >= 0 && iFootR >= 0)
+            {
+                float footYAfter = Mathf.Min(m[iFootL].GetColumn(3).y, m[iFootR].GetColumn(3).y);
+                float dy = footYBefore - footYAfter;
+                if (Mathf.Abs(dy) > 1e-5f)
+                {
+                    Vector3 shift = new Vector3(0f, dy, 0f);
+                    for (int b = 0; b < n; b++)
+                    {
+                        Vector3 pos = (Vector3)m[b].GetColumn(3) + shift;
+                        m[b] = Matrix4x4.TRS(pos, m[b].rotation, Vector3.one);
+                    }
+                }
+            }
+        }
+
+        private static bool IsDescendantOf(int[] parents, int node, int ancestor)
+        {
+            int cur = parents[node];
+            while (cur >= 0)
+            {
+                if (cur == ancestor) return true;
+                cur = parents[cur];
+            }
+            return false;
+        }
+
+        private static void ApplyVisualSurfaceRadii(IntPtr build, float scale)
+        {
+            if (build == IntPtr.Zero) return;
+            // Raise the head capsule out of the jaw into the helmet/skull center and widen it to match low-poly helmets
+            nm_build_set_head(build, 0.055f * scale, 1.38f);
+
+            // Enforce minimum capsule radii (metres at scale=1) matching Ravenfield's chunky mesh so fallen limbs/hands/vest never sink into floors.
+            // IMPORTANT: Do NOT inflate Shin L/R (parts 2 & 5) above ankle height (~0.058m) or both shins protrude below the feet
+            // and grind the ground while standing (cnt=108 instead of 72), causing backward drift & premature falls!
+            var minRadii = new (int part, float minRad)[]
+            {
+                (1, 0.092f), (4, 0.092f),   // Thigh L/R
+                (9, 0.122f), (10, 0.130f),  // Spine2, Spine3 (armored chest vest)
+                (11, 0.072f),               // Neck
+                (14, 0.076f), (18, 0.076f), // Upper Arm L/R
+                (15, 0.068f), (19, 0.068f), // Lower Arm L/R
+                (16, 0.058f), (20, 0.058f), // Hand L/R (up from 0.017m!)
+            };
+            var curRad = new float[1];
+            for (int i = 0; i < minRadii.Length; i++)
+            {
+                int p = minRadii[i].part;
+                float want = minRadii[i].minRad * scale;
+                if (nm_build_part_info(build, p, null, curRad, null, out _) >= 0 && curRad[0] * scale < want)
+                {
+                    nm_build_set_part_radius(build, p, want);
+                }
+            }
         }
 
         private static Transform FindHipsFallback(List<Transform> bones, Dictionary<string, int> overrides)

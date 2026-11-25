@@ -132,35 +132,96 @@ namespace DeliriumRavenfield.Core
             }
 
             sb.AppendLine();
-            sb.AppendLine("--- Live Trace (t_sec, phase, bal, fall, relax, dead, com_z, speed, pelvis_z, chest_z, head_z, lfoot_z, rfoot_z, lhand_z, rhand_z) ---");
+            sb.AppendLine("--- Live Trace (t_sec, phase, bal, fall, relax, dead, contacts, worldTris, groundY, actorY, ragLocY, comY, speed, topStrainJoints) ---");
             File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
             return path;
         }
 
         public static void AppendTraceSample(string path, float elapsedSec, ActorRagdollController ctrl)
         {
-            if (ctrl == null || ctrl.Agent == IntPtr.Zero || string.IsNullOrEmpty(path)) return;
+            if (ctrl == null || string.IsNullOrEmpty(path)) return;
             var ci = CultureInfo.InvariantCulture;
+            var sb = new StringBuilder(1024);
+
+            Vector3 actorPos = ctrl.Actor != null ? ctrl.Actor.transform.position : Vector3.zero;
+            float ragLocY = (ctrl.Actor?.ragdoll != null && ctrl.Actor.ragdoll.transform != ctrl.Actor.transform)
+                ? ctrl.Actor.ragdoll.transform.localPosition.y
+                : 0f;
+            float groundY = Plugin.Runtime != null && ctrl.Actor != null
+                ? Plugin.Runtime.SampleGroundHeight(actorPos + Vector3.up * 0.5f, ctrl.Actor.transform, actorPos.y)
+                : float.NaN;
+
+            if (ctrl.Agent == IntPtr.Zero)
+            {
+                sb.AppendLine(string.Format(ci,
+                    "  t={0,4:F2}s phase={1,-14} (no native agent) | actorY={2,6:F3} groundY={3,6:F3} ragLocY={4,6:F3}",
+                    elapsedSec, ctrl.Phase, actorPos.y, groundY, ragLocY));
+                File.AppendAllText(path, sb.ToString());
+                return;
+            }
+
             var com = new float[3];
             var vel = new float[3];
             nm_agent_get_com(ctrl.Agent, com, vel);
             float speed = Mathf.Sqrt(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
-
-            float PartZ(int partIdx)
+            int contactCount = 0;
+            for (int k = 0; k < 21; k++)
             {
-                var p = new float[3];
-                return nm_agent_get_part_transform(ctrl.Agent, partIdx, p, null) >= 0 ? p[2] : float.NaN;
+                if (nm_agent_get_part_contact(ctrl.Agent, k) != 0) contactCount++;
             }
 
-            string line = string.Format(ci,
-                "  t={0,4:F2}s phase={1,-14} bal={2} fall={3} relax={4} dead={5} | comZ={6,6:F3} v={7,6:F3} | pelv={8,6:F3} chest={9,6:F3} head={10,6:F3} lft={11,6:F3} rft={12,6:F3} lhd={13,6:F3} rhd={14,6:F3}",
+            int worldTris = ctrl.WorldEntry != null ? ctrl.WorldEntry.TriangleCount : 0;
+            int effCount = nm_agent_effector_count(ctrl.Agent);
+
+            // Collect Playroom-style joint angles (actual -> desired), error, and strength/damping
+            var actual = new float[3];
+            var desired = new float[3];
+            var stats = new float[4];
+            var nameBuf = new byte[64];
+            var jointLines = new System.Collections.Generic.List<(float errDeg, string summary)>(20);
+
+            for (int j = 0; j < effCount; j++)
+            {
+                int dof = nm_agent_get_effector(ctrl.Agent, j, actual, desired, null, stats, null);
+                if (dof <= 0) continue;
+                int nlen = nm_agent_effector_name(ctrl.Agent, j, nameBuf, nameBuf.Length);
+                string jname = nlen > 1 ? Encoding.UTF8.GetString(nameBuf, 0, Math.Min(nlen - 1, nameBuf.Length - 1)) : $"j{j}";
+
+                float errRad = 0f;
+                for (int a = 0; a < dof; a++)
+                {
+                    float d = actual[a] - desired[a];
+                    errRad += d * d;
+                }
+                float errDeg = Mathf.Sqrt(errRad) * Mathf.Rad2Deg;
+
+                string angStr = dof == 3
+                    ? string.Format(ci, "({0,4:F0},{1,4:F0},{2,4:F0})->({3,4:F0},{4,4:F0},{5,4:F0})",
+                        actual[0] * Mathf.Rad2Deg, actual[1] * Mathf.Rad2Deg, actual[2] * Mathf.Rad2Deg,
+                        desired[0] * Mathf.Rad2Deg, desired[1] * Mathf.Rad2Deg, desired[2] * Mathf.Rad2Deg)
+                    : string.Format(ci, "{0,4:F0}->{1,4:F0}", actual[0] * Mathf.Rad2Deg, desired[0] * Mathf.Rad2Deg);
+
+                jointLines.Add((errDeg, string.Format(ci, "{0}:{1} err={2:F0}deg sd={3:F0}/{4:F0}", jname, angStr, errDeg, stats[0], stats[1])));
+            }
+
+            jointLines.Sort((a, b) => b.errDeg.CompareTo(a.errDeg));
+            var topSb = new StringBuilder(180);
+            int topN = Math.Min(4, jointLines.Count);
+            for (int i = 0; i < topN; i++)
+            {
+                if (i > 0) topSb.Append(" | ");
+                topSb.Append(jointLines[i].summary);
+            }
+
+            sb.AppendLine(string.Format(ci,
+                "  t={0,4:F2}s phase={1,-14} bal={2} fall={3} rel={4} dead={5} cnt={6,2} tris={7,4} | gY={8,6:F3} actY={9,6:F3} ragLY={10,5:F2} comZ={11,6:F3} v={12,5:F2} | TOP: {13}",
                 elapsedSec, ctrl.Phase,
                 nm_agent_is_balancing(ctrl.Agent), nm_agent_has_fallen(ctrl.Agent),
                 nm_agent_is_relaxing(ctrl.Agent), nm_agent_is_dead(ctrl.Agent),
-                com[2], speed,
-                PartZ(0), PartZ(10), PartZ(12), PartZ(3), PartZ(6), PartZ(16), PartZ(20));
+                contactCount, worldTris,
+                groundY, actorPos.y, ragLocY, com[2], speed, topSb));
 
-            File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);
+            File.AppendAllText(path, sb.ToString());
         }
 
         private static string Fmt(Vector3 v, CultureInfo ci) => string.Format(ci, "({0:F3},{1:F3},{2:F3})", v.x, v.y, v.z);

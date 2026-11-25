@@ -17,6 +17,10 @@ namespace DeliriumRavenfield.Core
         public Vector3 Anchor;
         public int SceneId;
         public int RefCount;
+        public int TriangleCount;
+        public int UnreadableMeshCount;
+        /// <summary>Flat array of Unity world-space triangle vertices (3 per tri) for optional 3D BVH debug overlay.</summary>
+        public Vector3[] DebugTriangles;
     }
 
     internal sealed class TrackedVehicle
@@ -41,6 +45,9 @@ namespace DeliriumRavenfield.Core
         private readonly List<(float friction, float bounce)> surfaceTable = new List<(float, float)>();
         private readonly Dictionary<Vehicle, TrackedVehicle> trackedVehicles = new Dictionary<Vehicle, TrackedVehicle>();
         private readonly List<TrackedVehicle> activeVehicleFrameList = new List<TrackedVehicle>();
+        private readonly HashSet<Rigidbody> looseMoverSet = new HashSet<Rigidbody>();
+        private readonly List<Rigidbody> looseMoverList = new List<Rigidbody>();
+        private int lastSyncedBoxCount;
         private readonly Stopwatch stepWatch = new Stopwatch();
 
         private float accumulator;
@@ -52,6 +59,7 @@ namespace DeliriumRavenfield.Core
         public float LastStepMs { get; private set; }
         public int ActiveWorldCount => worlds.Count;
         public int ActiveVehicleCount => activeVehicleFrameList.Count;
+        public IReadOnlyList<SharedWorldEntry> Worlds => worlds;
 
         public DeliriumRuntime(ModConfig config)
         {
@@ -150,8 +158,10 @@ namespace DeliriumRavenfield.Core
         public SharedWorldEntry AcquireWorld(Vector3 hipsPos, float groundY, Transform ignoreOwner, float scale, int sceneId)
         {
             var spot = new Vector3(hipsPos.x, groundY, hipsPos.z);
-            float shareRadius = 8f * scale;
-            float shareHeight = 1.0f * scale;
+            float shareRadius = 6f * scale;
+            // Share within 1.5m vertical so bots on adjacent stair steps collide with each other,
+            // while bots on separate building stories (~3m apart) still get their own ceiling-aware world.
+            float shareHeight = 1.5f * scale;
 
             for (int i = 0; i < worlds.Count; i++)
             {
@@ -171,8 +181,6 @@ namespace DeliriumRavenfield.Core
                 throw new Exception($"nm_world_create failed: {LastError()}");
 
             Check(nm_world_set_scale(worldPtr, scale), "nm_world_set_scale");
-            PopulateStaticGeometry(worldPtr, hipsPos, groundY, ignoreOwner, scale);
-
             var entry = new SharedWorldEntry
             {
                 World = worldPtr,
@@ -181,6 +189,7 @@ namespace DeliriumRavenfield.Core
                 SceneId = sceneId,
                 RefCount = 1
             };
+            PopulateStaticGeometry(entry, hipsPos, groundY, ignoreOwner, scale);
             worlds.Add(entry);
             return entry;
         }
@@ -221,7 +230,7 @@ namespace DeliriumRavenfield.Core
 
             stepWatch.Restart();
 
-            if (config.EnableVehicles.Value)
+            if (config.EnableVehicles.Value || config.EnableEnginePhysicsColliders.Value)
                 SyncVehicles(activeControllers, deltaTime);
 
             // Fixed 60 Hz Delirium physics stepping (capped at 4 substeps per frame to prevent spiral of death)
@@ -242,6 +251,7 @@ namespace DeliriumRavenfield.Core
                     for (int ci = 0; ci < activeControllers.Count; ci++)
                     {
                         var ctrl = activeControllers[ci];
+                        if (ctrl.IsSyncLockstepControlled) continue;
                         if (ctrl.WorldEntry == w && ctrl.Agent != IntPtr.Zero && ctrl.IsSimulating)
                             agentList.Add(ctrl.Agent);
                     }
@@ -253,8 +263,9 @@ namespace DeliriumRavenfield.Core
                 }
             }
 
-            // Process vehicle impacts after stepping
-            if (config.EnableVehicles.Value && activeVehicleFrameList.Count > 0)
+            // Process vehicle / dynamic object impacts after stepping
+            if ((config.EnableVehicles.Value || config.EnableEnginePhysicsColliders.Value) &&
+                (activeVehicleFrameList.Count > 0 || looseMoverList.Count > 0))
             {
                 ProcessVehicleHits(activeControllers);
             }
@@ -266,59 +277,101 @@ namespace DeliriumRavenfield.Core
         private void SyncVehicles(IReadOnlyList<ActorRagdollController> activeControllers, float dt)
         {
             activeVehicleFrameList.Clear();
-            var am = ActorManager.instance;
-            if (am == null || am.vehicles == null) return;
+            looseMoverSet.Clear();
+            looseMoverList.Clear();
 
+            var am = ActorManager.instance;
             var cam = Camera.main;
             Vector3 camPos = cam != null ? cam.transform.position : Vector3.zero;
             float maxDistSqr = (config.ActiveDistance.Value + 25f) * (config.ActiveDistance.Value + 25f);
 
-            // Prune destroyed vehicles
-            var deadKeys = trackedVehicles.Keys.Where(v => v == null || !v.gameObject.activeInHierarchy).ToList();
-            foreach (var k in deadKeys) trackedVehicles.Remove(k);
-
-            foreach (var veh in am.vehicles)
+            if (config.EnableVehicles.Value && am != null && am.vehicles != null)
             {
-                if (veh == null || !veh.gameObject.activeInHierarchy || veh.isTurret) continue;
-                if (cam != null && (veh.transform.position - camPos).sqrMagnitude > maxDistSqr) continue;
+                // Prune destroyed vehicles
+                var deadKeys = trackedVehicles.Keys.Where(v => v == null || !v.gameObject.activeInHierarchy).ToList();
+                foreach (var k in deadKeys) trackedVehicles.Remove(k);
 
-                if (!trackedVehicles.TryGetValue(veh, out var tv))
+                foreach (var veh in am.vehicles)
                 {
-                    tv = CreateTrackedVehicle(veh);
-                    trackedVehicles[veh] = tv;
-                }
+                    if (veh == null || !veh.gameObject.activeInHierarchy || veh.isTurret) continue;
+                    if (cam != null && (veh.transform.position - camPos).sqrMagnitude > maxDistSqr) continue;
 
-                Transform t = veh.transform;
-                Quaternion q = t.rotation;
-                if (tv.Initialized && dt > 1e-4f)
-                {
-                    tv.Vel = veh.rigidbody != null ? veh.rigidbody.velocity : (t.position - tv.LastPos) / dt;
-                    (q * Quaternion.Inverse(tv.LastRot)).ToAngleAxis(out float deg, out Vector3 axis);
-                    if (deg > 180f) deg -= 360f;
-                    tv.Spin = (float.IsInfinity(axis.x) || float.IsNaN(axis.x) || Mathf.Abs(deg) < 1e-4f)
-                        ? Vector3.zero
-                        : axis * (deg * Mathf.Deg2Rad / dt);
-                }
-                else
-                {
-                    tv.Vel = veh.rigidbody != null ? veh.rigidbody.velocity : Vector3.zero;
-                    tv.Spin = Vector3.zero;
-                    tv.Initialized = true;
-                }
+                    if (!trackedVehicles.TryGetValue(veh, out var tv))
+                    {
+                        tv = CreateTrackedVehicle(veh);
+                        trackedVehicles[veh] = tv;
+                    }
 
-                tv.LastPos = t.position;
-                tv.LastRot = q;
-                activeVehicleFrameList.Add(tv);
+                    Transform t = veh.transform;
+                    Quaternion q = t.rotation;
+                    if (tv.Initialized && dt > 1e-4f)
+                    {
+                        tv.Vel = veh.rigidbody != null ? veh.rigidbody.velocity : (t.position - tv.LastPos) / dt;
+                        (q * Quaternion.Inverse(tv.LastRot)).ToAngleAxis(out float deg, out Vector3 axis);
+                        if (deg > 180f) deg -= 360f;
+                        tv.Spin = (float.IsInfinity(axis.x) || float.IsNaN(axis.x) || Mathf.Abs(deg) < 1e-4f)
+                            ? Vector3.zero
+                            : axis * (deg * Mathf.Deg2Rad / dt);
+                    }
+                    else
+                    {
+                        tv.Vel = veh.rigidbody != null ? veh.rigidbody.velocity : Vector3.zero;
+                        tv.Spin = Vector3.zero;
+                        tv.Initialized = true;
+                    }
+
+                    tv.LastPos = t.position;
+                    tv.LastRot = q;
+                    activeVehicleFrameList.Add(tv);
+                }
             }
 
-            if (activeVehicleFrameList.Count == 0) return;
+            // Also gather nearby loose dynamic Unity rigidbodies (crates, barrels, debris, physics props) as NM_HIT_OBJECT movers
+            if (config.EnableEnginePhysicsColliders.Value && worlds.Count > 0)
+            {
+                int mask = ~ignoredStaticLayersMask;
+                for (int wi = 0; wi < worlds.Count; wi++)
+                {
+                    var w = worlds[wi];
+                    if (w.World == IntPtr.Zero) continue;
+                    var cols = Physics.OverlapSphere(w.Anchor, 6f * w.Scale, mask, QueryTriggerInteraction.Ignore);
+                    for (int ci = 0; ci < cols.Length; ci++)
+                    {
+                        var col = cols[ci];
+                        if (col == null || col.isTrigger) continue;
+                        var rb = col.attachedRigidbody;
+                        if (rb == null || rb.isKinematic || rb.IsSleeping()) continue;
+                        if (rb.GetComponentInParent<Actor>() != null || rb.GetComponentInParent<Vehicle>() != null) continue;
+                        if (looseMoverSet.Add(rb) && looseMoverList.Count < 24)
+                            looseMoverList.Add(rb);
+                    }
+                }
+            }
 
-            int count = activeVehicleFrameList.Count;
+            int vehCount = activeVehicleFrameList.Count;
+            int moverCount = looseMoverList.Count;
+            int count = vehCount + moverCount;
+            if (count == 0)
+            {
+                if (lastSyncedBoxCount > 0)
+                {
+                    var empty = Array.Empty<float>();
+                    for (int wi = 0; wi < worlds.Count; wi++)
+                    {
+                        var w = worlds[wi].World;
+                        if (w != IntPtr.Zero) nm_world_set_boxes(w, empty, 0);
+                    }
+                    lastSyncedBoxCount = 0;
+                }
+                return;
+            }
+            lastSyncedBoxCount = count;
+
             var boxes = new float[count * 13];
             var kinds = new int[count];
             var spins = new float[count * 3];
 
-            for (int k = 0; k < count; k++)
+            for (int k = 0; k < vehCount; k++)
             {
                 var tv = activeVehicleFrameList[k];
                 Transform t = tv.Vehicle.transform;
@@ -345,6 +398,32 @@ namespace DeliriumRavenfield.Core
                 }
             }
 
+            for (int m = 0; m < moverCount; m++)
+            {
+                int k = vehCount + m;
+                var rb = looseMoverList[m];
+                var col = rb.GetComponentInChildren<Collider>();
+                Vector3 half = col != null ? col.bounds.extents : Vector3.one * 0.25f;
+                Vector3 center = col != null ? col.bounds.center : rb.worldCenterOfMass;
+                half = new Vector3(
+                    Mathf.Clamp(half.x, 0.08f, 3f),
+                    Mathf.Clamp(half.y, 0.08f, 3f),
+                    Mathf.Clamp(half.z, 0.08f, 3f));
+
+                WriteNmVec(center, boxes, k * 13);
+                WriteNmQuat(rb.rotation, boxes, k * 13 + 3);
+                boxes[k * 13 + 7] = half.x;
+                boxes[k * 13 + 8] = half.z;
+                boxes[k * 13 + 9] = half.y;
+                WriteNmVec(rb.velocity, boxes, k * 13 + 10);
+
+                kinds[k] = NM_HIT_OBJECT;
+                var sp = ToNmSpin(rb.angularVelocity);
+                spins[k * 3] = sp[0];
+                spins[k * 3 + 1] = sp[1];
+                spins[k * 3 + 2] = sp[2];
+            }
+
             for (int wi = 0; wi < worlds.Count; wi++)
             {
                 var w = worlds[wi].World;
@@ -354,13 +433,13 @@ namespace DeliriumRavenfield.Core
                 nm_world_set_box_spins(w, spins, count);
             }
 
-            // Drive active brace controllers
+            // Drive active brace controllers (only for vehicle indices)
             for (int ci = 0; ci < activeControllers.Count; ci++)
             {
                 var ctrl = activeControllers[ci];
                 if (ctrl.BracingVehicleIndex < 0 || !ctrl.IsSimulating || ctrl.Agent == IntPtr.Zero) continue;
                 ctrl.BraceTimeLeft -= dt;
-                if (ctrl.BraceTimeLeft <= 0f || ctrl.BracingVehicleIndex >= count)
+                if (ctrl.BraceTimeLeft <= 0f || ctrl.BracingVehicleIndex >= vehCount)
                 {
                     ctrl.BracingVehicleIndex = -1;
                     continue;
@@ -458,8 +537,9 @@ namespace DeliriumRavenfield.Core
             };
         }
 
-        private void PopulateStaticGeometry(IntPtr world, Vector3 center, float groundY, Transform ignoreOwner, float scale)
+        private void PopulateStaticGeometry(SharedWorldEntry entry, Vector3 center, float groundY, Transform ignoreOwner, float scale)
         {
+            IntPtr world = entry.World;
             const float radius = 15f;
             float r = radius * scale;
             var pts = new List<float>(4096);
@@ -488,6 +568,10 @@ namespace DeliriumRavenfield.Core
                 mats.Add(mat);
             }
 
+            Collider groundCol = SampleGroundCollider(center, ignoreOwner);
+            bool addedGroundCol = false;
+            var unreadableMeshes = new List<MeshCollider>();
+
             int layerMask = ~ignoredStaticLayersMask;
             var colliders = Physics.OverlapSphere(center, r, layerMask, QueryTriggerInteraction.Ignore);
             for (int ci = 0; ci < colliders.Length; ci++)
@@ -498,29 +582,37 @@ namespace DeliriumRavenfield.Core
                 if (col.attachedRigidbody != null && !col.attachedRigidbody.isKinematic) continue;
                 if (col.GetComponentInParent<Actor>() != null || col.GetComponentInParent<Vehicle>() != null) continue;
 
+                int trisBefore = tris.Count;
                 Transform t = col.transform;
                 Vector3 ls = t.lossyScale;
                 bool negScale = (ls.x * ls.y * ls.z) < 0f;
                 mat = ResolveSurfaceMaterial(col);
 
-                if (col is MeshCollider mc && mc.sharedMesh != null && mc.sharedMesh.isReadable)
+                if (col is MeshCollider mc && mc.sharedMesh != null)
                 {
-                    var mesh = mc.sharedMesh;
-                    var rawVerts = mesh.vertices;
-                    var indices = mesh.triangles;
-                    var worldVerts = new Vector3[rawVerts.Length];
-                    for (int vi = 0; vi < rawVerts.Length; vi++)
-                        worldVerts[vi] = t.TransformPoint(rawVerts[vi]);
-
-                    for (int ti = 0; ti + 2 < indices.Length; ti += 3)
+                    if (mc.sharedMesh.isReadable)
                     {
-                        Vector3 a = worldVerts[indices[ti]];
-                        Vector3 b = worldVerts[indices[ti + 1]];
-                        Vector3 d = worldVerts[indices[ti + 2]];
-                        Vector3 mid = (a + b + d) * (1f / 3f);
-                        float triRadius = Mathf.Max((a - mid).magnitude, Mathf.Max((b - mid).magnitude, (d - mid).magnitude));
-                        if ((mid - center).magnitude < r + triRadius)
-                            AddTri(a, b, d, negScale);
+                        var mesh = mc.sharedMesh;
+                        var rawVerts = mesh.vertices;
+                        var indices = mesh.triangles;
+                        var worldVerts = new Vector3[rawVerts.Length];
+                        for (int vi = 0; vi < rawVerts.Length; vi++)
+                            worldVerts[vi] = t.TransformPoint(rawVerts[vi]);
+
+                        for (int ti = 0; ti + 2 < indices.Length; ti += 3)
+                        {
+                            Vector3 a = worldVerts[indices[ti]];
+                            Vector3 b = worldVerts[indices[ti + 1]];
+                            Vector3 d = worldVerts[indices[ti + 2]];
+                            Vector3 mid = (a + b + d) * (1f / 3f);
+                            float triRadius = Mathf.Max((a - mid).magnitude, Mathf.Max((b - mid).magnitude, (d - mid).magnitude));
+                            if ((mid - center).magnitude < r + triRadius)
+                                AddTri(a, b, d, negScale);
+                        }
+                    }
+                    else
+                    {
+                        unreadableMeshes.Add(mc);
                     }
                 }
                 else if (col is BoxCollider box)
@@ -552,6 +644,87 @@ namespace DeliriumRavenfield.Core
                         AddTri(k[f[0]], k[f[2]], k[f[3]], negScale);
                     }
                 }
+                else if (col is SphereCollider sph)
+                {
+                    Vector3 worldCenter = t.TransformPoint(sph.center);
+                    float maxScale = Mathf.Max(Mathf.Abs(ls.x), Mathf.Max(Mathf.Abs(ls.y), Mathf.Abs(ls.z)));
+                    float sr = sph.radius * maxScale;
+                    if (sr < 0.04f || (worldCenter - center).magnitude < sr * 0.9f) continue;
+
+                    const int segs = 10;
+                    const int rings = 5;
+                    Vector3 top = worldCenter + Vector3.up * sr;
+                    Vector3 bot = worldCenter - Vector3.up * sr;
+                    var ringVerts = new Vector3[rings - 1, segs];
+                    for (int ri = 1; ri < rings; ri++)
+                    {
+                        float phi = Mathf.PI * ri / rings;
+                        float y = Mathf.Cos(phi) * sr;
+                        float rr = Mathf.Sin(phi) * sr;
+                        for (int si = 0; si < segs; si++)
+                        {
+                            float theta = (Mathf.PI * 2f * si) / segs;
+                            ringVerts[ri - 1, si] = worldCenter + new Vector3(Mathf.Cos(theta) * rr, y, Mathf.Sin(theta) * rr);
+                        }
+                    }
+                    for (int si = 0; si < segs; si++)
+                    {
+                        int sn = (si + 1) % segs;
+                        AddTri(top, ringVerts[0, sn], ringVerts[0, si]);
+                        AddTri(bot, ringVerts[rings - 2, si], ringVerts[rings - 2, sn]);
+                        for (int ri = 0; ri < rings - 2; ri++)
+                        {
+                            AddTri(ringVerts[ri, si], ringVerts[ri, sn], ringVerts[ri + 1, sn]);
+                            AddTri(ringVerts[ri, si], ringVerts[ri + 1, sn], ringVerts[ri + 1, si]);
+                        }
+                    }
+                }
+                else if (col is CapsuleCollider cap)
+                {
+                    Vector3 localAxis = cap.direction == 0 ? Vector3.right : (cap.direction == 2 ? Vector3.forward : Vector3.up);
+                    Vector3 localU = cap.direction == 0 ? Vector3.up : Vector3.right;
+                    Vector3 localV = Vector3.Cross(localAxis, localU).normalized;
+
+                    float axisScale = cap.direction == 0 ? Mathf.Abs(ls.x) : (cap.direction == 2 ? Mathf.Abs(ls.z) : Mathf.Abs(ls.y));
+                    float radScale = cap.direction == 0
+                        ? Mathf.Max(Mathf.Abs(ls.y), Mathf.Abs(ls.z))
+                        : (cap.direction == 2 ? Mathf.Max(Mathf.Abs(ls.x), Mathf.Abs(ls.y)) : Mathf.Max(Mathf.Abs(ls.x), Mathf.Abs(ls.z)));
+
+                    float cr = cap.radius * radScale;
+                    float halfCyl = Mathf.Max(0f, cap.height * axisScale * 0.5f - cr);
+                    if (cr < 0.04f) continue;
+
+                    Vector3 worldCenter = t.TransformPoint(cap.center);
+                    Vector3 wAxis = (t.rotation * localAxis).normalized;
+                    Vector3 wU = (t.rotation * localU).normalized;
+                    Vector3 wV = (t.rotation * localV).normalized;
+                    Vector3 topCap = worldCenter + wAxis * halfCyl;
+                    Vector3 botCap = worldCenter - wAxis * halfCyl;
+
+                    const int segs = 10;
+                    var topRing = new Vector3[segs];
+                    var botRing = new Vector3[segs];
+                    for (int si = 0; si < segs; si++)
+                    {
+                        float theta = (Mathf.PI * 2f * si) / segs;
+                        Vector3 off = (wU * Mathf.Cos(theta) + wV * Mathf.Sin(theta)) * cr;
+                        topRing[si] = topCap + off;
+                        botRing[si] = botCap + off;
+                    }
+                    Vector3 topTip = topCap + wAxis * cr;
+                    Vector3 botTip = botCap - wAxis * cr;
+                    for (int si = 0; si < segs; si++)
+                    {
+                        int sn = (si + 1) % segs;
+                        if (halfCyl > 0.01f)
+                        {
+                            AddTri(topRing[si], topRing[sn], botRing[sn]);
+                            AddTri(topRing[si], botRing[sn], botRing[si]);
+                        }
+                        AddTri(topTip, topRing[sn], topRing[si]);
+                        AddTri(botTip, botRing[si], botRing[sn]);
+                    }
+                }
                 else if (col is TerrainCollider tc && tc.terrainData != null)
                 {
                     var td = tc.terrainData;
@@ -577,40 +750,279 @@ namespace DeliriumRavenfield.Core
                         }
                     }
                 }
+
+                if (col == groundCol && tris.Count > trisBefore)
+                    addedGroundCol = true;
+            }
+
+            // Reconstruct non-readable MeshColliders (common in standard & Workshop Ravenfield maps for stairs,
+            // buildings, bridges, and rocks) using PhysX Collider.Raycast so ragdolls roll accurately down stairs
+            // and drop off ledges instead of hitting a flat invisible safety floor!
+            int sampledTrisBefore = tris.Count;
+            for (int ui = 0; ui < unreadableMeshes.Count; ui++)
+            {
+                var mc = unreadableMeshes[ui];
+                mat = ResolveSurfaceMaterial(mc);
+                int before = tris.Count;
+                SampleColliderViaRaycast(mc, center, groundY, scale, AddTri);
+                if (mc == groundCol && tris.Count > before)
+                    addedGroundCol = true;
+            }
+
+            // Fallback: if the specific ground collider under the bot wasn't captured by any primitive above,
+            // sample it directly via Collider.Raycast (without spawning an infinite flat plane over drops/stairs).
+            if (groundCol != null && !addedGroundCol)
+            {
+                mat = ResolveSurfaceMaterial(groundCol);
+                int before = tris.Count;
+                SampleColliderViaRaycast(groundCol, center, groundY, scale, AddTri);
+                if (tris.Count > before)
+                    addedGroundCol = true;
             }
 
             if (tris.Count > 0)
             {
                 nm_world_add_mesh(world, pts.ToArray(), pts.Count / 3, tris.ToArray(), tris.Count / 3, mats.ToArray());
-            }
+                entry.TriangleCount = tris.Count / 3;
+                entry.UnreadableMeshCount = unreadableMeshes.Count;
 
-            // Add a safety floor below feet in case map meshes are marked non-readable.
-            // Offset 2.5cm below groundY when real level triangles already exist so we never create
-            // coplanar duplicate floor planes (which double contact impulses and cause ground launches!).
-            float safetyFloorY = tris.Count > 0 ? (groundY - 0.025f) : groundY;
-            byte floorMat = ResolveSurfaceMaterial(SampleGroundCollider(center, ignoreOwner));
-            if (floorMat == 0)
-            {
-                nm_world_add_floor(world, center.x, center.z, safetyFloorY, 80f * scale);
+                // Cache up to 3500 nearby triangles in Unity space for the live 3D BVH wireframe overlay
+                int triCount = tris.Count / 3;
+                int maxKeep = Mathf.Min(triCount, 3500);
+                var dbg = new List<Vector3>(maxKeep * 3);
+                float dbgRadiusSqr = (11f * scale) * (11f * scale);
+                for (int ti = 0; ti < triCount && dbg.Count < maxKeep * 3; ti++)
+                {
+                    int i0 = (int)tris[ti * 3] * 3;
+                    int i1 = (int)tris[ti * 3 + 1] * 3;
+                    int i2 = (int)tris[ti * 3 + 2] * 3;
+                    var a = new Vector3(pts[i0], pts[i0 + 2], pts[i0 + 1]);
+                    var b = new Vector3(pts[i1], pts[i1 + 2], pts[i1 + 1]);
+                    var c = new Vector3(pts[i2], pts[i2 + 2], pts[i2 + 1]);
+                    Vector3 mid = (a + b + c) * (1f / 3f);
+                    if ((mid - center).sqrMagnitude <= dbgRadiusSqr)
+                    {
+                        dbg.Add(a);
+                        dbg.Add(b);
+                        dbg.Add(c);
+                    }
+                }
+                entry.DebugTriangles = dbg.ToArray();
             }
             else
             {
-                float h = 80f * scale;
-                var v = new[]
+                // Only add a flat fallback floor when literally zero static world triangles exist nearby.
+                // NEVER add an infinite horizontal floor at groundY when real geometry exists — doing so
+                // puts an invisible glass floor across stairs, ledges, roofs, and balconies!
+                byte floorMat = ResolveSurfaceMaterial(groundCol);
+                float h = 24f * scale;
+                if (floorMat == 0)
                 {
-                    center.x - h, center.z - h, safetyFloorY,
-                    center.x + h, center.z - h, safetyFloorY,
-                    center.x + h, center.z + h, safetyFloorY,
-                    center.x - h, center.z + h, safetyFloorY
-                };
-                nm_world_add_mesh(world, v, 4, new uint[] { 0, 1, 2, 0, 2, 3 }, 2, new[] { floorMat, floorMat });
+                    nm_world_add_floor(world, center.x, center.z, groundY, h);
+                }
+                else
+                {
+                    var v = new[]
+                    {
+                        center.x - h, center.z - h, groundY,
+                        center.x + h, center.z - h, groundY,
+                        center.x + h, center.z + h, groundY,
+                        center.x - h, center.z + h, groundY
+                    };
+                    nm_world_add_mesh(world, v, 4, new uint[] { 0, 1, 2, 0, 2, 3 }, 2, new[] { floorMat, floorMat });
+                }
+                entry.TriangleCount = 2;
+                entry.UnreadableMeshCount = unreadableMeshes.Count;
+                float dh = 6f * scale;
+                Vector3 p0 = new Vector3(center.x - dh, groundY, center.z - dh);
+                Vector3 p1 = new Vector3(center.x + dh, groundY, center.z - dh);
+                Vector3 p2 = new Vector3(center.x + dh, groundY, center.z + dh);
+                Vector3 p3 = new Vector3(center.x - dh, groundY, center.z + dh);
+                entry.DebugTriangles = new[] { p0, p1, p2, p0, p2, p3 };
             }
+
+            if (config.DebugLog.Value)
+            {
+                int totalTris = tris.Count / 3;
+                int sampledTris = (tris.Count - sampledTrisBefore) / 3;
+                Plugin.Log.LogInfo($"[DeliriumRuntime] Built world at {center:F1} (groundY={groundY:F2}): tris={totalTris} (unreadableMeshes={unreadableMeshes.Count}, sampledTris={sampledTris}, addedGround={addedGroundCol})");
+            }
+        }
+
+        private static void SampleColliderViaRaycast(
+            Collider col,
+            Vector3 center,
+            float groundY,
+            float scale,
+            Action<Vector3, Vector3, Vector3, bool> addTri)
+        {
+            if (col == null) return;
+            Bounds b = col.bounds;
+            float maxR = 13.0f * scale;
+            float padX = Mathf.Min(0.01f, b.extents.x * 0.1f);
+            float padZ = Mathf.Min(0.01f, b.extents.z * 0.1f);
+            float minX = Mathf.Max(b.min.x + padX, center.x - maxR);
+            float maxX = Mathf.Min(b.max.x - padX, center.x + maxR);
+            float minZ = Mathf.Max(b.min.z + padZ, center.z - maxR);
+            float maxZ = Mathf.Min(b.max.z - padZ, center.z + maxR);
+            if (maxX <= minX + 0.02f || maxZ <= minZ + 0.02f) return;
+
+            // Detect whether this collider has a ceiling/roof directly above the actor so indoor floors/stairs aren't occluded
+            float rayStartY;
+            bool hasCeiling = col.Raycast(new Ray(new Vector3(center.x, groundY + 0.45f, center.z), Vector3.up), out RaycastHit ceilHit, 8f * scale);
+            if (hasCeiling)
+                rayStartY = Mathf.Clamp(ceilHit.point.y - 0.12f, groundY + 1.45f * scale, groundY + 3.2f * scale);
+            else
+                rayStartY = Mathf.Min(b.max.y + 0.5f, groundY + 3.5f * scale);
+
+            float rayMinY = Mathf.Max(b.min.y - 0.5f, groundY - 12.0f * scale);
+            if (b.min.y > rayStartY || b.max.y < rayMinY) return;
+            float rayLen = Mathf.Max(rayStartY - rayMinY, 1.0f);
+
+            // Graded tensor-product grid: fine 0.25m step near actor (captures every stair tread crisply),
+            // 0.50m mid-range (long stair flights & ramps), 1.25m outer ring — zero T-junctions!
+            List<float> xs = BuildGradedAxis(center.x, minX, maxX, scale);
+            List<float> zs = BuildGradedAxis(center.z, minZ, maxZ, scale);
+            int nx = xs.Count;
+            int nz = zs.Count;
+            if (nx < 2 || nz < 2) return;
+
+            var hits = new Vector3[nx, nz];
+            var valid = new bool[nx, nz];
+            float overhangThresholdY = groundY + 2.15f * scale;
+
+            for (int ix = 0; ix < nx; ix++)
+            {
+                float x = xs[ix];
+                for (int iz = 0; iz < nz; iz++)
+                {
+                    float z = zs[iz];
+                    var ray = new Ray(new Vector3(x, rayStartY, z), Vector3.down);
+                    if (!col.Raycast(ray, out RaycastHit h, rayLen)) continue;
+
+                    // If we hit a roof/porch overhang well above head height, check for a walkable surface beneath it
+                    if (h.point.y > overhangThresholdY)
+                    {
+                        float subStartY = h.point.y - 0.15f;
+                        float subLen = subStartY - rayMinY;
+                        if (subLen > 0.5f &&
+                            col.Raycast(new Ray(new Vector3(x, subStartY, z), Vector3.down), out RaycastHit h2, subLen) &&
+                            (h.point.y - h2.point.y) >= 1.55f * scale &&
+                            Mathf.Abs(h2.point.y - groundY) <= 1.5f * scale)
+                        {
+                            h = h2;
+                        }
+                    }
+
+                    hits[ix, iz] = h.point;
+                    valid[ix, iz] = true;
+                }
+            }
+
+            float maxJump = 4.0f * scale;
+            for (int ix = 0; ix < nx - 1; ix++)
+            {
+                for (int iz = 0; iz < nz - 1; iz++)
+                {
+                    bool v00 = valid[ix, iz];
+                    bool v01 = valid[ix, iz + 1];
+                    bool v11 = valid[ix + 1, iz + 1];
+                    bool v10 = valid[ix + 1, iz];
+
+                    if (v00 && v01 && v11)
+                    {
+                        Vector3 p00 = hits[ix, iz];
+                        Vector3 p01 = hits[ix, iz + 1];
+                        Vector3 p11 = hits[ix + 1, iz + 1];
+                        float yMin = Mathf.Min(p00.y, Mathf.Min(p01.y, p11.y));
+                        float yMax = Mathf.Max(p00.y, Mathf.Max(p01.y, p11.y));
+                        if (yMax - yMin <= maxJump)
+                            addTri(p00, p01, p11, false);
+                    }
+                    if (v00 && v11 && v10)
+                    {
+                        Vector3 p00 = hits[ix, iz];
+                        Vector3 p11 = hits[ix + 1, iz + 1];
+                        Vector3 p10 = hits[ix + 1, iz];
+                        float yMin = Mathf.Min(p00.y, Mathf.Min(p11.y, p10.y));
+                        float yMax = Mathf.Max(p00.y, Mathf.Max(p11.y, p10.y));
+                        if (yMax - yMin <= maxJump)
+                            addTri(p00, p11, p10, false);
+                    }
+                }
+            }
+
+            // Also cast 16 lightweight horizontal rays at chest height so vertical walls inside non-readable
+            // MeshColliders still trigger NM_XR_WALL bracing and stop ragdolls from clipping into walls.
+            float wallProbeY = groundY + 1.0f * scale;
+            if (b.min.y <= wallProbeY && b.max.y >= wallProbeY)
+            {
+                float wallProbeDist = 5.5f * scale;
+                Vector3 probeOrigin = new Vector3(center.x, wallProbeY, center.z);
+                const int rays = 16;
+                var usedCells = new HashSet<long>();
+
+                for (int ri = 0; ri < rays; ri++)
+                {
+                    float ang = (Mathf.PI * 2f * ri) / rays;
+                    Vector3 dir = new Vector3(Mathf.Cos(ang), 0f, Mathf.Sin(ang));
+                    if (!col.Raycast(new Ray(probeOrigin, dir), out RaycastHit wh, wallProbeDist)) continue;
+                    if (Mathf.Abs(wh.normal.y) > 0.45f) continue;
+
+                    Vector3 n = new Vector3(wh.normal.x, 0f, wh.normal.z);
+                    if (n.sqrMagnitude < 1e-4f) continue;
+                    n.Normalize();
+
+                    // Deduplicate nearby wall hits on the same 0.6m cell
+                    int cx = Mathf.RoundToInt(wh.point.x / 0.6f);
+                    int cz = Mathf.RoundToInt(wh.point.z / 0.6f);
+                    long key = ((long)cx << 32) ^ (uint)cz;
+                    if (!usedCells.Add(key)) continue;
+
+                    Vector3 right = Vector3.Cross(Vector3.up, n).normalized;
+                    float hw = 0.65f * scale;
+                    float hBot = 1.05f * scale;
+                    float hTop = 1.35f * scale;
+                    Vector3 bl = wh.point - right * hw - Vector3.up * hBot;
+                    Vector3 tl = wh.point - right * hw + Vector3.up * hTop;
+                    Vector3 tr = wh.point + right * hw + Vector3.up * hTop;
+                    Vector3 br = wh.point + right * hw - Vector3.up * hBot;
+
+                    // Orient outward normal along `n` (AddTri(a, b, d) produces Unity normal Cross(b - a, d - a))
+                    bool flip = Vector3.Dot(Vector3.Cross(tl - bl, tr - bl), n) < 0f;
+                    addTri(bl, tl, tr, flip);
+                    addTri(bl, tr, br, flip);
+                }
+            }
+        }
+
+        private static List<float> BuildGradedAxis(float centerCoord, float minCoord, float maxCoord, float scale)
+        {
+            var coords = new List<float>(60);
+            float span = maxCoord - minCoord;
+            float nearHalf = 3.5f * scale;
+            float midHalf = 8.0f * scale;
+            float stepNear = Mathf.Max(0.05f, Mathf.Min(0.25f * scale, span * 0.25f));
+            float stepMid = 0.50f * scale;
+            float stepFar = 1.25f * scale;
+
+            float x = minCoord;
+            coords.Add(x);
+            while (x < maxCoord - 1e-3f)
+            {
+                float d = Mathf.Abs(x - centerCoord);
+                float step = d < nearHalf ? stepNear : (d < midHalf ? stepMid : stepFar);
+                x = Mathf.Min(x + step, maxCoord);
+                coords.Add(x);
+            }
+            return coords;
         }
 
         public float SampleGroundHeight(Vector3 fromPos, Transform ignoreOwner, float fallbackY)
         {
             int mask = ~ignoredStaticLayersMask;
-            var hits = Physics.RaycastAll(fromPos + Vector3.up * 0.2f, Vector3.down, 6f, mask, QueryTriggerInteraction.Ignore);
+            Vector3 origin = fromPos + Vector3.up * 0.6f;
+            var hits = Physics.RaycastAll(origin, Vector3.down, 10f, mask, QueryTriggerInteraction.Ignore);
             float bestDist = float.MaxValue;
             float bestY = fallbackY;
             for (int i = 0; i < hits.Length; i++)
@@ -618,6 +1030,9 @@ namespace DeliriumRavenfield.Core
                 var h = hits[i];
                 if (h.collider == null || h.collider.isTrigger) continue;
                 if (ignoreOwner != null && h.transform.IsChildOf(ignoreOwner)) continue;
+                if (h.collider.attachedRigidbody != null && !h.collider.attachedRigidbody.isKinematic) continue;
+                if (h.collider.GetComponentInParent<Actor>() != null || h.collider.GetComponentInParent<Vehicle>() != null) continue;
+                if (h.point.y > fromPos.y + 0.35f) continue;
                 if (h.distance < bestDist)
                 {
                     bestDist = h.distance;
@@ -630,7 +1045,8 @@ namespace DeliriumRavenfield.Core
         private Collider SampleGroundCollider(Vector3 fromPos, Transform ignoreOwner)
         {
             int mask = ~ignoredStaticLayersMask;
-            var hits = Physics.RaycastAll(fromPos + Vector3.up * 0.2f, Vector3.down, 6f, mask, QueryTriggerInteraction.Ignore);
+            Vector3 origin = fromPos + Vector3.up * 0.6f;
+            var hits = Physics.RaycastAll(origin, Vector3.down, 10f, mask, QueryTriggerInteraction.Ignore);
             float bestDist = float.MaxValue;
             Collider best = null;
             for (int i = 0; i < hits.Length; i++)
@@ -638,6 +1054,9 @@ namespace DeliriumRavenfield.Core
                 var h = hits[i];
                 if (h.collider == null || h.collider.isTrigger) continue;
                 if (ignoreOwner != null && h.transform.IsChildOf(ignoreOwner)) continue;
+                if (h.collider.attachedRigidbody != null && !h.collider.attachedRigidbody.isKinematic) continue;
+                if (h.collider.GetComponentInParent<Actor>() != null || h.collider.GetComponentInParent<Vehicle>() != null) continue;
+                if (h.point.y > fromPos.y + 0.35f) continue;
                 if (h.distance < bestDist)
                 {
                     bestDist = h.distance;

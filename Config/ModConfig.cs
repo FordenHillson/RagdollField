@@ -32,6 +32,17 @@ namespace DeliriumRavenfield.Config
         public ConfigEntry<bool> StepLimit { get; }
         public ConfigEntry<bool> ArmsOutEarlyOnCar { get; }
         public ConfigEntry<bool> EnableExtraReactions { get; }
+        public ConfigEntry<bool> EnableEnvironmentReactions { get; }
+        public ConfigEntry<bool> EnableDyingStagger { get; }
+        public ConfigEntry<float> DyingStaggerChance { get; }
+        public ConfigEntry<float> DyingStaggerMinSeconds { get; }
+        public ConfigEntry<float> DyingStaggerMaxSeconds { get; }
+        public ConfigEntry<int> DyingStaggerMaxFollowUpHits { get; }
+        public ConfigEntry<bool> EnableDyingBleed { get; }
+        public ConfigEntry<bool> EnableBlindFire { get; }
+        public ConfigEntry<float> BlindFireChance { get; }
+        public ConfigEntry<float> BlindFireMaxSeconds { get; }
+        public ConfigEntry<float> BlindFireWildSpreadDegrees { get; }
         public ConfigEntry<bool> EnableDeathAgony { get; }
         public ConfigEntry<float> DeathAgonyChance { get; }
         public ConfigEntry<float> DeathAgonyMinSeconds { get; }
@@ -54,6 +65,8 @@ namespace DeliriumRavenfield.Config
         public ConfigEntry<bool> EnableNearMissFlinch { get; }
         public ConfigEntry<float> NearMissRadius { get; }
         public ConfigEntry<float> NearMissDistanceLimit { get; }
+        public ConfigEntry<bool> EnableEnginePhysicsColliders { get; }
+        public ConfigEntry<bool> EnableCorpseShootAndWake { get; }
 
         // [Skeleton]
         public ConfigEntry<string> SizeMode { get; }
@@ -61,13 +74,34 @@ namespace DeliriumRavenfield.Config
         public ConfigEntry<string> BodyPreset { get; }
         public ConfigEntry<string> BoneMap { get; }
 
+        // [LocationalHealth]
+        public ConfigEntry<bool> EnableLocationalHealth { get; }
+        public ConfigEntry<float> LegHpRatio { get; }
+        public ConfigEntry<float> ArmHpRatio { get; }
+        public ConfigEntry<float> StomachHpRatio { get; }
+        public ConfigEntry<float> ChestHpRatio { get; }
+        public ConfigEntry<float> HeartFatalDamageThreshold { get; }
+        public ConfigEntry<float> BleedRateArm { get; }
+        public ConfigEntry<float> BleedRateLeg { get; }
+        public ConfigEntry<float> BleedRateStomach { get; }
+        public ConfigEntry<float> BleedRateChest { get; }
+        public ConfigEntry<bool> EnableSurrenderAiIgnore { get; }
+        public ConfigEntry<bool> EnableMedkitStopBleed { get; }
+        public ConfigEntry<float> WoundedSpreadMultiplier { get; }
+        public ConfigEntry<int> BleedingFinishHitsMin { get; }
+        public ConfigEntry<int> BleedingFinishHitsMax { get; }
+
         // [TestRange]
         public ConfigEntry<KeyCode> UiHotkey { get; }
         public ConfigEntry<KeyCode> TestRangeHotkey { get; }
         public ConfigEntry<KeyCode> AimPushHotkey { get; }
         public ConfigEntry<KeyCode> ReleaseAllHotkey { get; }
+        public ConfigEntry<KeyCode> SpawnDummyHotkey { get; }
         public ConfigEntry<float> AimPushForce { get; }
         public ConfigEntry<bool> UiStartOpen { get; }
+        public ConfigEntry<bool> ShowMainMenuTestButton { get; }
+        public ConfigEntry<bool> TestArenaAutoRespawn { get; }
+        public ConfigEntry<float> TestArenaRespawnDelay { get; }
 
         public ModConfig(ConfigFile cfg)
         {
@@ -95,8 +129,8 @@ namespace DeliriumRavenfield.Config
             ShotForceScale = cfg.Bind("Reactions", "ShotForceScale", 1.0f,
                 new ConfigDescription("Multiplier for normalized bullet impact impulses into Delirium.",
                     new AcceptableValueRange<float>(0.2f, 3.0f)));
-            AliveShotPushScale = cfg.Bind("Reactions", "AliveShotPushScale", 0.45f,
-                new ConfigDescription("Impulse scale for non-lethal shots on standing bots so they visibly stagger and clutch wounds before going down.",
+            AliveShotPushScale = cfg.Bind("Reactions", "AliveShotPushScale", 0.78f,
+                new ConfigDescription("Impulse scale for non-lethal shots on standing bots so they visibly stagger backwards and clutch wounds before going down.",
                     new AcceptableValueRange<float>(0.15f, 1.5f)));
             MinShotImpulse = cfg.Bind("Reactions", "MinShotImpulse", 16f,
                 new ConfigDescription("Minimum normalized impulse (N*s) for light SMG/pistol hits.",
@@ -104,12 +138,12 @@ namespace DeliriumRavenfield.Config
             MaxShotImpulse = cfg.Bind("Reactions", "MaxShotImpulse", 72f,
                 new ConfigDescription("Soft-cap normalized single-shot impulse (N*s) so extreme modded guns knock back naturally without twitching.",
                     new AcceptableValueRange<float>(30f, 140f)));
-            MaxBurstImpulse = cfg.Bind("Reactions", "MaxBurstImpulse", 92f,
-                new ConfigDescription("Maximum combined impulse (N*s) within a short burst window (protects against multi-pellet shotguns & rapid-fire mods).",
-                    new AcceptableValueRange<float>(45f, 180f)));
-            MaxLimbDeltaV = cfg.Bind("Reactions", "MaxLimbDeltaV", 5.5f,
+            MaxBurstImpulse = cfg.Bind("Reactions", "MaxBurstImpulse", 260f,
+                new ConfigDescription("Maximum combined impulse (N*s) within a short burst window (high enough for realistic Playroom rapid-fire bursts while capping extreme modded guns).",
+                    new AcceptableValueRange<float>(60f, 500f)));
+            MaxLimbDeltaV = cfg.Bind("Reactions", "MaxLimbDeltaV", 8.5f,
                 new ConfigDescription("Max instantaneous velocity jump (m/s) applied to a light limb/head; excess impulse transfers naturally into torso/pelvis.",
-                    new AcceptableValueRange<float>(2.0f, 12.0f)));
+                    new AcceptableValueRange<float>(3.0f, 16.0f)));
             MaxExplosionSpeed = cfg.Bind("Reactions", "MaxExplosionSpeed", 16f,
                 new ConfigDescription("Soft-cap throw speed (m/s) for explosions so modded blast weapons stay natural.",
                     new AcceptableValueRange<float>(8f, 28f)));
@@ -127,7 +161,36 @@ namespace DeliriumRavenfield.Config
             ArmsOutEarlyOnCar = cfg.Bind("Reactions", "ArmsOutEarlyOnCar", true,
                 "Throw arms out early when bracing against an approaching vehicle.");
             EnableExtraReactions = cfg.Bind("Reactions", "EnableExtraReactions", false,
-                "Enable experimental Playroom extra reactions (arms windmill, curl on shot, ledge stumble). Off matches standard game defaults and avoids floor spasms.");
+                "Enable experimental Playroom extra reactions (arms windmill, curl on shot). Off avoids floor spasms.");
+            EnableEnvironmentReactions = cfg.Bind("Reactions", "EnableEnvironmentReactions", true,
+                "Enable Delirium muscle-driven environment reactions during stagger and dying collapse (wall bracing NM_XR_WALL, ledge stumble NM_XR_LEDGE, smart fall, stairs roll, weakened catchFall).");
+            EnableDyingStagger = cfg.Bind("Reactions", "EnableDyingStagger", true,
+                "Non-headshot, non-explosion fatal hits enter standing dying stagger with wound-clutching and gradual muscle decay before collapsing.");
+            DyingStaggerChance = cfg.Bind("Reactions", "DyingStaggerChance", 0.85f,
+                new ConfigDescription("Probability (0-1) that an eligible fatal hit enters dying stagger + wound clutching.",
+                    new AcceptableValueRange<float>(0f, 1f)));
+            DyingStaggerMinSeconds = cfg.Bind("Reactions", "DyingStaggerMinSeconds", 1.2f,
+                new ConfigDescription("Minimum duration (s) of standing dying stagger before muscles give out.",
+                    new AcceptableValueRange<float>(0.5f, 4.0f)));
+            DyingStaggerMaxSeconds = cfg.Bind("Reactions", "DyingStaggerMaxSeconds", 2.8f,
+                new ConfigDescription("Maximum duration (s) of standing dying stagger before collapsing.",
+                    new AcceptableValueRange<float>(1.0f, 6.0f)));
+            DyingStaggerMaxFollowUpHits = cfg.Bind("Reactions", "DyingStaggerMaxFollowUpHits", 2,
+                new ConfigDescription("Number of follow-up body hits during dying stagger before forcing immediate collapse (headshots always drop immediately).",
+                    new AcceptableValueRange<int>(1, 6)));
+            EnableDyingBleed = cfg.Bind("Reactions", "EnableDyingBleed", true,
+                "Emit pulsing blood drops and spurts from the wound bone during dying stagger and early collapse.");
+            EnableBlindFire = cfg.Bind("Reactions", "EnableBlindFire", true,
+                "Shot bots have a chance to accidentally discharge their firearm in wild erratic directions while startled, staggering, or falling.");
+            BlindFireChance = cfg.Bind("Reactions", "BlindFireChance", 0.45f,
+                new ConfigDescription("Probability (0-1) that a shot bot carrying a loaded gun accidentally pulls the trigger while staggering or collapsing.",
+                    new AcceptableValueRange<float>(0f, 1f)));
+            BlindFireMaxSeconds = cfg.Bind("Reactions", "BlindFireMaxSeconds", 0.65f,
+                new ConfigDescription("Maximum duration (s) of an accidental reflex burst on full-auto weapons (semi-auto/shotguns fire 1 sudden round).",
+                    new AcceptableValueRange<float>(0.15f, 1.5f)));
+            BlindFireWildSpreadDegrees = cfg.Bind("Reactions", "BlindFireWildSpreadDegrees", 38f,
+                new ConfigDescription("Extra wild angular deflection (degrees) added on top of the flailing ragdoll muzzle direction during accidental discharge.",
+                    new AcceptableValueRange<float>(10f, 80f)));
             EnableDeathAgony = cfg.Bind("Reactions", "EnableDeathAgony", true,
                 "Non-headshot fatal hits trigger subtle dying movement (writhing, curling, weak reaching) before going fully limp.");
             DeathAgonyChance = cfg.Bind("Reactions", "DeathAgonyChance", 0.75f,
@@ -179,6 +242,10 @@ namespace DeliriumRavenfield.Config
             NearMissDistanceLimit = cfg.Bind("Environment", "NearMissDistanceLimit", 45f,
                 new ConfigDescription("Max distance from camera (m) to process near-miss flinch checks.",
                     new AcceptableValueRange<float>(10f, 120f)));
+            EnableEnginePhysicsColliders = cfg.Bind("Environment", "EnableEnginePhysicsColliders", true,
+                "Sync 21-part kinematic Unity colliders in FixedUpdate (Delirium EnginePhysics) so dying/dead ragdolls physically push loose props and interact with triggers without snagging the player.");
+            EnableCorpseShootAndWake = cfg.Bind("Environment", "EnableCorpseShootAndWake", true,
+                "Allow bullets, melee, explosions, and vehicles to hit dying/dead corpses and wake frozen corpses back into Delirium simulation.");
 
             SizeMode = cfg.Bind("Skeleton", "SizeMode", "Auto",
                 new ConfigDescription("Auto (recommended), Real (exact bone scale), or Homer (person-scaled world).",
@@ -191,14 +258,65 @@ namespace DeliriumRavenfield.Config
             BoneMap = cfg.Bind("Skeleton", "BoneMap", "",
                 "Custom Workshop skin bone overrides: BoneName=Part pairs (e.g. Pelvis_jnt=Buttocks, Tail=None).");
 
+            EnableLocationalHealth = cfg.Bind("LocationalHealth", "EnableLocationalHealth", true,
+                "Enable locational body-part health, bleedout, hopping/crawling, wound clutching, and gun-arm surrender on AI bots.");
+            LegHpRatio = cfg.Bind("LocationalHealth", "LegHpRatio", 0.45f,
+                new ConfigDescription("Each leg's HP as a fraction of actor maxHealth.",
+                    new AcceptableValueRange<float>(0.15f, 1.0f)));
+            ArmHpRatio = cfg.Bind("LocationalHealth", "ArmHpRatio", 0.40f,
+                new ConfigDescription("Each arm's HP as a fraction of actor maxHealth.",
+                    new AcceptableValueRange<float>(0.15f, 1.0f)));
+            StomachHpRatio = cfg.Bind("LocationalHealth", "StomachHpRatio", 0.55f,
+                new ConfigDescription("Stomach HP as a fraction of actor maxHealth.",
+                    new AcceptableValueRange<float>(0.20f, 1.2f)));
+            ChestHpRatio = cfg.Bind("LocationalHealth", "ChestHpRatio", 0.60f,
+                new ConfigDescription("Right/center chest HP as a fraction of actor maxHealth.",
+                    new AcceptableValueRange<float>(0.20f, 1.2f)));
+            HeartFatalDamageThreshold = cfg.Bind("LocationalHealth", "HeartFatalDamageThreshold", 15f,
+                new ConfigDescription("Minimum cumulative damage on anatomical left chest (heart) to trigger fatal dying stagger.",
+                    new AcceptableValueRange<float>(1f, 60f)));
+            BleedRateArm = cfg.Bind("LocationalHealth", "BleedRateArm", 5.5f,
+                new ConfigDescription("Blood drain per second (out of 100) per ruined arm.",
+                    new AcceptableValueRange<float>(1f, 25f)));
+            BleedRateLeg = cfg.Bind("LocationalHealth", "BleedRateLeg", 6.0f,
+                new ConfigDescription("Blood drain per second (out of 100) per ruined leg.",
+                    new AcceptableValueRange<float>(1f, 25f)));
+            BleedRateStomach = cfg.Bind("LocationalHealth", "BleedRateStomach", 9.5f,
+                new ConfigDescription("Blood drain per second (out of 100) when stomach reaches 0 HP.",
+                    new AcceptableValueRange<float>(1f, 30f)));
+            BleedRateChest = cfg.Bind("LocationalHealth", "BleedRateChest", 10.0f,
+                new ConfigDescription("Blood drain per second (out of 100) when chest reaches 0 HP.",
+                    new AcceptableValueRange<float>(1f, 30f)));
+            EnableSurrenderAiIgnore = cfg.Bind("LocationalHealth", "EnableSurrenderAiIgnore", true,
+                "When a bot drops its gun and surrenders (gun arm ruined), enemy AI stops targeting it while the player can still shoot.");
+            EnableMedkitStopBleed = cfg.Bind("LocationalHealth", "EnableMedkitStopBleed", true,
+                "Medipack healing stops active bleeding and restores blood.");
+            WoundedSpreadMultiplier = cfg.Bind("LocationalHealth", "WoundedSpreadMultiplier", 2.5f,
+                new ConfigDescription("Extra aim spread multiplier while firing one-handed, hopping, clutching, or crawling.",
+                    new AcceptableValueRange<float>(1.0f, 6.0f)));
+            BleedingFinishHitsMin = cfg.Bind("LocationalHealth", "BleedingFinishHitsMin", 2,
+                new ConfigDescription("Minimum follow-up hits on an actively bleeding bot to kill them immediately.",
+                    new AcceptableValueRange<int>(1, 8)));
+            BleedingFinishHitsMax = cfg.Bind("LocationalHealth", "BleedingFinishHitsMax", 3,
+                new ConfigDescription("Maximum follow-up hits on an actively bleeding bot to kill them immediately.",
+                    new AcceptableValueRange<int>(1, 8)));
+
             UiHotkey = cfg.Bind("TestRange", "UiHotkey", KeyCode.F7, "Toggle the in-game Delirium Test Panel.");
-            TestRangeHotkey = cfg.Bind("TestRange", "TestRangeHotkey", KeyCode.F8, "Toggle Test Range mode (bots stand idle and do not fire).");
+            TestRangeHotkey = cfg.Bind("TestRange", "TestRangeHotkey", KeyCode.F8, "Toggle Test Range mode (Pure Dummy <-> Normal AI).");
             AimPushHotkey = cfg.Bind("TestRange", "AimPushHotkey", KeyCode.F9, "Push/ragdoll the bot under your crosshair.");
             ReleaseAllHotkey = cfg.Bind("TestRange", "ReleaseAllHotkey", KeyCode.F10, "Release all active Delirium ragdolls back to Ravenfield.");
+            SpawnDummyHotkey = cfg.Bind("TestRange", "SpawnDummyHotkey", KeyCode.F6, "Spawn/move a stationary enemy dummy bot at your crosshair.");
             AimPushForce = cfg.Bind("TestRange", "AimPushForce", 60f,
                 new ConfigDescription("Impulse (N s) applied when pressing AimPushHotkey.",
                     new AcceptableValueRange<float>(10f, 300f)));
             UiStartOpen = cfg.Bind("TestRange", "UiStartOpen", false, "Open the Delirium Test Panel automatically on game start.");
+            ShowMainMenuTestButton = cfg.Bind("TestRange", "ShowMainMenuTestButton", true,
+                "Show a 1-click 'Launch Delirium Test Range' button on the Ravenfield Main Menu.");
+            TestArenaAutoRespawn = cfg.Bind("TestRange", "TestArenaAutoRespawn", true,
+                "Automatically respawn dead station dummies back at their test positions on Delirium Test Range.");
+            TestArenaRespawnDelay = cfg.Bind("TestRange", "TestArenaRespawnDelay", 4.5f,
+                new ConfigDescription("Seconds after a test dummy dies before auto-respawning at its station slot.",
+                    new AcceptableValueRange<float>(1.0f, 30.0f)));
         }
 
         public void ResetGameplayDefaults()
@@ -210,7 +328,7 @@ namespace DeliriumRavenfield.Config
 
             MuscleStrength.Value = 1.0f;
             ShotForceScale.Value = 1.0f;
-            AliveShotPushScale.Value = 0.45f;
+            AliveShotPushScale.Value = 0.78f;
             MinShotImpulse.Value = 16f;
             MaxShotImpulse.Value = 72f;
             MaxBurstImpulse.Value = 92f;
@@ -219,6 +337,19 @@ namespace DeliriumRavenfield.Config
             MaxExplosionSpeed.Value = 16f;
             MeleeForceScale.Value = 1.0f;
             EnableExtraReactions.Value = false;
+            EnableEnvironmentReactions.Value = true;
+            EnableDyingStagger.Value = true;
+            DyingStaggerChance.Value = 0.85f;
+            DyingStaggerMinSeconds.Value = 1.2f;
+            DyingStaggerMaxSeconds.Value = 2.8f;
+            DyingStaggerMaxFollowUpHits.Value = 2;
+            EnableDyingBleed.Value = true;
+            EnableBlindFire.Value = true;
+            BlindFireChance.Value = 0.45f;
+            BlindFireMaxSeconds.Value = 0.65f;
+            BlindFireWildSpreadDegrees.Value = 38f;
+            EnableEnginePhysicsColliders.Value = true;
+            EnableCorpseShootAndWake.Value = true;
             EnableDeathAgony.Value = true;
             DeathAgonyChance.Value = 0.75f;
             DeathAgonyMinSeconds.Value = 2.2f;
@@ -229,6 +360,22 @@ namespace DeliriumRavenfield.Config
             LyingStillBeforeGetUp.Value = 0.8f;
             MaxFallenBeforeGetUp.Value = 3.0f;
             EntryBlendSeconds.Value = 0.16f;
+
+            EnableLocationalHealth.Value = true;
+            LegHpRatio.Value = 0.45f;
+            ArmHpRatio.Value = 0.40f;
+            StomachHpRatio.Value = 0.55f;
+            ChestHpRatio.Value = 0.60f;
+            HeartFatalDamageThreshold.Value = 15f;
+            BleedRateArm.Value = 5.5f;
+            BleedRateLeg.Value = 6.0f;
+            BleedRateStomach.Value = 9.5f;
+            BleedRateChest.Value = 10.0f;
+            EnableSurrenderAiIgnore.Value = true;
+            EnableMedkitStopBleed.Value = true;
+            WoundedSpreadMultiplier.Value = 2.5f;
+            BleedingFinishHitsMin.Value = 2;
+            BleedingFinishHitsMax.Value = 3;
         }
     }
 }
