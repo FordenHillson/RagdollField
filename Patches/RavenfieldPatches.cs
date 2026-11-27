@@ -469,6 +469,16 @@ namespace DeliriumRavenfield.Patches
             }
         }
 
+        [HarmonyPatch(typeof(ActiveRaggy), "LateUpdate")]
+        private static class Patch_ActiveRaggy_LateUpdate
+        {
+            private static bool Prefix(ActiveRaggy __instance)
+            {
+                if (__instance == null || Plugin.LodManager == null) return true;
+                return !Plugin.LodManager.IsOwnedByDelirium(__instance);
+            }
+        }
+
         [HarmonyPatch(typeof(Actor), nameof(Actor.ApplyRigidbodyForce))]
         private static class Patch_Actor_ApplyRigidbodyForce
         {
@@ -499,7 +509,16 @@ namespace DeliriumRavenfield.Patches
         [HarmonyPatch(typeof(Actor), nameof(Actor.SetModelSkin))]
         private static class Patch_Actor_SetModelSkin
         {
-            private static void Prefix(Actor __instance) => Plugin.LodManager?.ReleaseActor(__instance, restoreGame: true);
+            private static void Prefix(Actor __instance)
+            {
+                if (__instance == null || Plugin.LodManager == null) return;
+                // ActorManager.ApplyOverrideActorSkin only swaps sharedMesh & materials on the SAME ragdoll skeleton.
+                // Never tear down an active/dying/dead Delirium ragdoll when a Gore/Dismemberment mutator swaps skins on death!
+                if (__instance.dead) return;
+                if (Plugin.LodManager.TryGetController(__instance, out var ctrl) && (ctrl.IsSimulating || ctrl.IsDeadOrFrozen))
+                    return;
+                Plugin.LodManager.ReleaseActor(__instance, restoreGame: true);
+            }
         }
 
         [HarmonyPatch(typeof(Actor), nameof(Actor.EnterSeat))]

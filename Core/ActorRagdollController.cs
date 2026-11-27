@@ -77,6 +77,15 @@ namespace DeliriumRavenfield.Core
             Phase == RagdollPhase.DeadSimulating ||
             Phase == RagdollPhase.DeadFrozen;
 
+        public float DeadElapsed => deadElapsed;
+        public bool IsDeadSafeToFreeze =>
+            Phase == RagdollPhase.DeadSimulating &&
+            deadRelaxed &&
+            deadLastOnGround &&
+            deadElapsed >= 0.90f &&
+            Mathf.Abs(lastComVel.y) < 0.18f &&
+            lastComVel.magnitude < Mathf.Max(config.FreezeDeadVelocityThreshold.Value * 1.5f, 0.35f);
+
         public bool SuppressVanillaGetUp =>
             Phase == RagdollPhase.ActiveStagger ||
             Phase == RagdollPhase.ActiveFallen ||
@@ -123,6 +132,7 @@ namespace DeliriumRavenfield.Core
         private float deadStillElapsed;
         private float deadElapsed;
         private bool deadRelaxed;
+        private bool deadLastOnGround;
         private Vector3 deadAnchorPos;
         private float deadAnchorElapsed;
         private float dyingStaggerElapsed;
@@ -291,7 +301,8 @@ namespace DeliriumRavenfield.Core
                 var rigBuild = runtime.SkeletonMapper.BuildRigForActor(Actor, runtime.BaseBuild, groundY);
                 if (rigBuild == null)
                 {
-                    RestoreRagdollRigidbodies();
+                    bool wake = Actor.dead || Actor.fallenOver || Actor.ragdoll.IsRagdoll();
+                    RestoreRagdollRigidbodies(wakeUp: wake, inheritVelocity: wake ? (Vector3?)Actor.Velocity() : null);
                     return false;
                 }
 
@@ -410,6 +421,7 @@ namespace DeliriumRavenfield.Core
                 deadStillElapsed = 0f;
                 deadElapsed = 0f;
                 deadRelaxed = false;
+                deadLastOnGround = false;
                 deadAnchorElapsed = 0f;
                 worldReanchorCooldown = 0.5f;
                 ResetDyingStaggerState();
@@ -465,7 +477,8 @@ namespace DeliriumRavenfield.Core
             {
                 Plugin.Log.LogWarning($"[Delirium] Failed takeover for {Actor?.name}: {ex.Message}");
                 ReleaseNativeOnly();
-                RestoreRagdollRigidbodies();
+                bool wake = Actor != null && (Actor.dead || Actor.fallenOver || (Actor.ragdoll != null && Actor.ragdoll.IsRagdoll()));
+                RestoreRagdollRigidbodies(wakeUp: wake, inheritVelocity: wake ? (Vector3?)Actor.Velocity() : null);
                 Phase = RagdollPhase.Animated;
                 return false;
             }
@@ -1920,6 +1933,7 @@ namespace DeliriumRavenfield.Core
                 deadElapsed = 0f;
                 deadStillElapsed = 0f;
                 deadRelaxed = false;
+                deadLastOnGround = false;
                 deadAnchorElapsed = 0f;
                 deadAnchorPos = lastComPos;
                 if (!keepEnvReactions)
@@ -2143,18 +2157,37 @@ namespace DeliriumRavenfield.Core
             if (Phase == RagdollPhase.DeadSimulating)
             {
                 deadElapsed += dt;
-                float groundY = hips != null
-                    ? runtime.SampleGroundHeight(hips.position + Vector3.up * 0.4f, Actor.transform, hips.position.y - 4f)
-                    : lastComPos.y - 1f;
-                float hipsHeightAboveGround = hips != null ? (hips.position.y - groundY) : 0f;
+
+                // Use live Delirium part transforms (not stale pre-LateUpdate Unity bones) and a strict floor-normal
+                // sampler so vertical walls / moldings / props never spoof groundY and freeze a corpse mid-air!
+                Vector3 pelvisPos = hips != null ? hips.position : lastComPos;
+                var deadPelvisPos = new float[3];
+                if (nm_agent_get_part_transform(Agent, 0, deadPelvisPos, null) >= 0)
+                    pelvisPos = ToUnityVec(deadPelvisPos);
+
+                float groundY = runtime.SampleFloorHeightBelow(pelvisPos, Actor.transform, pelvisPos.y - 4f);
+                float hipsHeightAboveGround = pelvisPos.y - groundY;
                 float headHeightAboveGround = hipsHeightAboveGround;
                 var deadHeadPos = new float[3];
                 if (nm_agent_get_part_transform(Agent, 12, deadHeadPos, null) >= 0)
                     headHeightAboveGround = ToUnityVec(deadHeadPos).y - groundY;
 
-                // Measure real height of BOTH hips and head above floor so a crouching/squatting/wall-leaning corpse
-                // is NEVER mistakenly treated as lying flat on the floor and frozen upright!
-                bool onGroundOrLow = hipsHeightAboveGround < 0.46f * scale && headHeightAboveGround < 0.65f * scale;
+                bool hasContact = false;
+                for (int k = 0; k < 21; k++)
+                {
+                    if (nm_agent_get_part_contact(Agent, k) != 0)
+                    {
+                        hasContact = true;
+                        break;
+                    }
+                }
+
+                // Measure real height of BOTH hips and head above a true floor surface so a crouching/squatting/
+                // wall-leaning or mid-air falling corpse is NEVER mistakenly frozen before finishing its ragdoll!
+                bool onGroundOrLow = hipsHeightAboveGround > -0.25f * scale &&
+                                     hipsHeightAboveGround < 0.46f * scale &&
+                                     headHeightAboveGround < 0.65f * scale;
+                deadLastOnGround = onGroundOrLow && hasContact;
                 bool verticalSettled = Mathf.Abs(lastComVel.y) < 0.18f;
 
                 // Muscle-driven dying collapse phase: weakened catchFall + NM_XR_WALL/LEDGE/stairs active while going down
@@ -2174,7 +2207,7 @@ namespace DeliriumRavenfield.Core
                     if (!deathAgonyActive)
                     {
                         // Wait until corpse actually reaches the floor before starting ground agony!
-                        if (onGroundOrLow && deadElapsed >= 0.35f)
+                        if (onGroundOrLow && hasContact && deadElapsed >= 0.35f)
                         {
                             deathAgonyActive = true;
                             deathAgonyElapsed = 0f;
@@ -2228,17 +2261,18 @@ namespace DeliriumRavenfield.Core
                     if (!onGroundOrLow && deadElapsed >= 0.40f && lastComVel.magnitude < 0.40f && (hipsHeightAboveGround > 0.48f * scale || headHeightAboveGround > 0.68f * scale))
                     {
                         Vector3 slumpDir = (Actor.transform.forward * (UnityEngine.Random.value < 0.5f ? 1f : -1f) + Actor.transform.right * UnityEngine.Random.Range(-0.75f, 0.75f)).normalized;
-                        Vector3 at = hips != null ? hips.position + Vector3.up * 0.35f : lastComPos;
+                        Vector3 at = pelvisPos + Vector3.up * 0.35f;
                         ApplyNaturalDistributedImpulse(10, at, slumpDir, 22f, out _, out _);
                     }
 
-                    if (onGroundOrLow && verticalSettled && (resting || lastComVel.magnitude < config.FreezeDeadVelocityThreshold.Value))
+                    bool groundedContact = onGroundOrLow && (hasContact || resting);
+                    if (groundedContact && verticalSettled && (resting || lastComVel.magnitude < config.FreezeDeadVelocityThreshold.Value))
                         deadStillElapsed += dt;
                     else
                         deadStillElapsed = 0f;
 
-                    // Displacement-based settling: ONLY count while actually on/near the ground and not falling!
-                    if (onGroundOrLow && verticalSettled && (lastComPos - deadAnchorPos).sqrMagnitude < 0.08f * 0.08f)
+                    // Displacement-based settling: ONLY count while actually on the floor with contact and not falling!
+                    if (groundedContact && verticalSettled && (lastComPos - deadAnchorPos).sqrMagnitude < 0.08f * 0.08f)
                     {
                         deadAnchorElapsed += dt;
                     }
@@ -2248,18 +2282,23 @@ namespace DeliriumRavenfield.Core
                         deadAnchorElapsed = 0f;
                     }
 
-                    bool canNormalFreeze = onGroundOrLow && verticalSettled && deadElapsed >= 0.90f &&
+                    bool canNormalFreeze = groundedContact && verticalSettled && deadElapsed >= 0.90f &&
                         (deadStillElapsed >= config.FreezeDeadAfterSeconds.Value ||
                          deadAnchorElapsed >= 1.4f ||
                          (resting && deadStillElapsed >= 0.45f));
-                    bool canHardFreeze = deadElapsed >= hardFreezeLimit && verticalSettled && (onGroundOrLow || deadElapsed >= hardFreezeLimit + 4.0f);
+                    bool canHardFreezeOnGround = deadElapsed >= hardFreezeLimit && verticalSettled && groundedContact;
 
-                    if (canNormalFreeze || canHardFreeze)
+                    if (canNormalFreeze || canHardFreezeOnGround)
                     {
                         FreezeDeadCorpse();
                     }
+                    else if (deadElapsed >= hardFreezeLimit + 4.0f && !groundedContact)
+                    {
+                        // Snagged/airborne past hard timeout: hand off to live Unity PhysX gravity instead of freezing mid-air!
+                        ReleaseDeadToVanillaPhysics();
+                    }
                 }
-                else if (deadElapsed >= hardFreezeLimit && verticalSettled && onGroundOrLow)
+                else if (deadElapsed >= hardFreezeLimit && verticalSettled && onGroundOrLow && hasContact)
                 {
                     FreezeDeadCorpse();
                 }
@@ -2917,8 +2956,13 @@ namespace DeliriumRavenfield.Core
             Phase = RagdollPhase.DeadFrozen;
         }
 
-        public void ReleaseImmediate(bool restoreGame)
+        /// <summary>
+        /// Hands an unfinished / mid-air dead ragdoll back to live Unity PhysX (non-kinematic + woken with inherited velocity)
+        /// instead of freezing it floating in mid-air when evicted by LOD or hard-timeout.
+        /// </summary>
+        public void ReleaseDeadToVanillaPhysics()
         {
+            Vector3 carryVel = lastComVel;
             homerVisual.Dispose();
             CancelPhysicsGetUp(fallIfLow: false);
             RestoreChestBaseScales();
@@ -2932,7 +2976,34 @@ namespace DeliriumRavenfield.Core
             lastAppliedMuscleStrength = -1f;
             RestoreWeaponParentTransform();
             ReleaseNativeOnly();
-            RestoreRagdollRigidbodies();
+            EnsureRagdollCollidersEnabled();
+            RestoreRagdollRigidbodies(wakeUp: true, inheritVelocity: carryVel);
+            Physics.SyncTransforms();
+            animBlendBones = null;
+            BracingVehicleIndex = -1;
+            Phase = RagdollPhase.Animated;
+        }
+
+        public void ReleaseImmediate(bool restoreGame)
+        {
+            Vector3 carryVel = lastComVel;
+            bool shouldWakeDeadRagdoll = Actor != null && (Actor.dead || Actor.fallenOver) &&
+                                         Actor.ragdoll != null && Actor.ragdoll.IsRagdoll() &&
+                                         Phase != RagdollPhase.DeadFrozen;
+            homerVisual.Dispose();
+            CancelPhysicsGetUp(fallIfLow: false);
+            RestoreChestBaseScales();
+            ClearPartialKeyframe();
+            ResetDownedFightBackState();
+            StopBlindFire(dropIfDead: Actor != null && Actor.dead);
+            woundedCombat.StopPointArm(Agent, WorldEntry != null ? WorldEntry.World : IntPtr.Zero);
+            woundedCombat.RestoreActorFlags(HealthState);
+            woundedCombat.Reset();
+            activeWoundedBehavior = null;
+            lastAppliedMuscleStrength = -1f;
+            RestoreWeaponParentTransform();
+            ReleaseNativeOnly();
+            RestoreRagdollRigidbodies(wakeUp: shouldWakeDeadRagdoll, inheritVelocity: shouldWakeDeadRagdoll ? (Vector3?)carryVel : null);
             animBlendBones = null;
             BracingVehicleIndex = -1;
 
@@ -2982,30 +3053,55 @@ namespace DeliriumRavenfield.Core
 
         private void FreezeRagdollRigidbodies()
         {
-            kinematicBodies.Clear();
             if (Actor?.ragdoll?.rigidbodies == null) return;
             foreach (var rb in Actor.ragdoll.rigidbodies)
             {
                 if (rb == null) continue;
+                if (!kinematicBodies.Contains(rb))
+                    kinematicBodies.Add(rb);
                 if (!rb.isKinematic)
                 {
                     rb.velocity = Vector3.zero;
                     rb.angularVelocity = Vector3.zero;
                     rb.isKinematic = true;
                     rb.Sleep();
-                    kinematicBodies.Add(rb);
                 }
             }
         }
 
-        private void RestoreRagdollRigidbodies()
+        private void RestoreRagdollRigidbodies(bool wakeUp = false, Vector3? inheritVelocity = null)
         {
+            Vector3 clampedVel = Vector3.zero;
+            if (inheritVelocity.HasValue)
+            {
+                Vector3 v = inheritVelocity.Value;
+                if (!float.IsNaN(v.x) && !float.IsNaN(v.y) && !float.IsNaN(v.z))
+                    clampedVel = Vector3.ClampMagnitude(v, 10f);
+            }
+
+            // Include all rigidbodies on the ragdoll in case a prior DeadFrozen wake or external mod left any kinematic
+            if (Actor?.ragdoll?.rigidbodies != null)
+            {
+                foreach (var rb in Actor.ragdoll.rigidbodies)
+                {
+                    if (rb != null && rb.isKinematic && !kinematicBodies.Contains(rb))
+                        kinematicBodies.Add(rb);
+                }
+            }
+
             for (int i = 0; i < kinematicBodies.Count; i++)
             {
                 var rb = kinematicBodies[i];
-                if (rb != null)
+                if (rb == null) continue;
+                rb.isKinematic = false;
+                if (wakeUp)
                 {
-                    rb.isKinematic = false;
+                    rb.velocity = clampedVel;
+                    rb.angularVelocity = Vector3.zero;
+                    rb.WakeUp();
+                }
+                else
+                {
                     rb.velocity = Vector3.zero;
                     rb.angularVelocity = Vector3.zero;
                     rb.Sleep();
@@ -3424,6 +3520,13 @@ namespace DeliriumRavenfield.Core
 
         private void StartDyingStagger(NormalizedShot shot, int part, Vector3 point, float rapidScale)
         {
+            ClearPartialKeyframe();
+            StopActiveWoundedBehavior();
+            if (Agent != IntPtr.Zero && WorldEntry != null)
+            {
+                woundedCombat.StopPointArm(Agent, WorldEntry.World);
+                nm_agent_keyframe(Agent, "fb", 0);
+            }
             if (!blindFirePendingStart && !blindFireActive)
                 RestoreWeaponParentTransform();
             ClearIncomingArmFollow();

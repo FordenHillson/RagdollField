@@ -532,11 +532,16 @@ namespace DeliriumRavenfield.Core
                 if (ctrl.IsPlayer) continue;
 
                 float dist = cam != null && ctrl.Actor != null ? Vector3.Distance(ctrl.Actor.CenterPosition(), camPos) : 0f;
-                // Eviction priority: DeadSimulating (highest) > DyingStagger > ActiveStagger/Fallen > Live Wounded/Surrendering (lowest)
+                // Eviction priority: Settled DeadSimulating (highest) > DyingStagger > Airborne/Fresh DeadSimulating >
+                // ActiveStagger/Fallen > Live Wounded/Surrendering (lowest). Never steal a fresh mid-air corpse over settled ones!
                 float phaseBias;
                 switch (ctrl.Phase)
                 {
-                    case RagdollPhase.DeadSimulating: phaseBias = 1200f; break;
+                    case RagdollPhase.DeadSimulating:
+                        phaseBias = ctrl.IsDeadSafeToFreeze
+                            ? (1500f + Mathf.Min(ctrl.DeadElapsed * 40f, 400f))
+                            : (ctrl.DeadElapsed >= 1.5f ? 320f : 90f);
+                        break;
                     case RagdollPhase.DyingStagger: phaseBias = 400f; break;
                     case RagdollPhase.ActiveStagger:
                     case RagdollPhase.ActiveFallen: phaseBias = 120f; break;
@@ -553,18 +558,35 @@ namespace DeliriumRavenfield.Core
             if (current < cap) return true;
             if (victim == null) return false;
 
-            bool canSteal = victim.Phase == RagdollPhase.DeadSimulating ||
+            bool victimIsSettledDead = victim.Phase == RagdollPhase.DeadSimulating && victim.IsDeadSafeToFreeze;
+            bool victimIsUnsettledDead = victim.Phase == RagdollPhase.DeadSimulating && !victim.IsDeadSafeToFreeze;
+            bool victimIsFarther = cam != null && victim.Actor != null &&
+                                   Vector3.Distance(victim.Actor.CenterPosition(), camPos) > reqDist + 10f;
+
+            bool canSteal = victimIsSettledDead ||
+                            (victimIsUnsettledDead && (victimIsFarther || victim.DeadElapsed >= 1.5f)) ||
                             (highPriority && victim.Phase != RagdollPhase.WoundedStanding &&
                              victim.Phase != RagdollPhase.WoundedCrawling &&
                              victim.Phase != RagdollPhase.Surrendering &&
-                             cam != null && Vector3.Distance(victim.Actor.CenterPosition(), camPos) > reqDist + 10f);
+                             victimIsFarther);
 
             if (!canSteal) return false;
 
-            if (victim.Phase == RagdollPhase.DeadSimulating)
+            if (victimIsSettledDead)
+            {
                 victim.FreezeDeadCorpse();
+            }
+            else if (victimIsUnsettledDead)
+            {
+                // Still falling / mid-air: hand off to live Unity PhysX gravity instead of freezing in mid-air!
+                var victimActor = victim.Actor;
+                victim.ReleaseDeadToVanillaPhysics();
+                UnregisterActor(victimActor);
+            }
             else
+            {
                 victim.ReleaseImmediate(restoreGame: true);
+            }
 
             return true;
         }

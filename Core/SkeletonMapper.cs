@@ -164,7 +164,7 @@ namespace DeliriumRavenfield.Core
             for (int i = 0; i < n; i++)
             {
                 Vector3 pos = bindMatrices[i].GetColumn(3);
-                Quaternion rot = bindMatrices[i].rotation;
+                Quaternion rot = SafeMatrixRotation(bindMatrices[i]);
                 WriteNmVec(pos, restFrames, i * 7);
                 WriteNmQuat(rot, restFrames, i * 7 + 3);
                 WriteNmVec(pos, restPlaces, i * 3);
@@ -492,9 +492,11 @@ namespace DeliriumRavenfield.Core
                 if (known.TryGetValue(bones[b], out var k))
                     m[b] = k;
                 else if (parents[b] >= 0)
-                    m[b] = m[parents[b]] * (bones[parents[b]].worldToLocalMatrix * bones[b].localToWorldMatrix);
+                    // Use localPosition/localRotation instead of parent.worldToLocalMatrix so dismembered/zero-scaled
+                    // gore bones (localScale = 0) never produce singular/NaN matrices that crash takeover!
+                    m[b] = m[parents[b]] * Matrix4x4.TRS(bones[b].localPosition, bones[b].localRotation, Vector3.one);
                 else
-                    m[b] = bones[b].localToWorldMatrix;
+                    m[b] = Matrix4x4.TRS(bones[b].position, bones[b].rotation, Vector3.one);
             }
 
             float nowLen = 0f, bindLen = 0f;
@@ -502,6 +504,10 @@ namespace DeliriumRavenfield.Core
             {
                 if (parents[b] >= 0)
                 {
+                    if (parts[b] < 0 && !known.ContainsKey(bones[b])) continue;
+                    // Skip collapsed/zero-scaled bones (e.g. dismembered limbs) so they don't shrink overall body scale
+                    if (bones[b].lossyScale.sqrMagnitude < 1e-4f || bones[parents[b]].lossyScale.sqrMagnitude < 1e-4f)
+                        continue;
                     nowLen += (bones[b].position - bones[parents[b]].position).magnitude;
                     bindLen += ((Vector3)m[b].GetColumn(3) - (Vector3)m[parents[b]].GetColumn(3)).magnitude;
                 }
@@ -591,7 +597,7 @@ namespace DeliriumRavenfield.Core
             for (int b = 0; b < bones.Length; b++)
             {
                 Vector3 pos = alignedHipPos + alignRot * RawPos(b);
-                Quaternion rot = alignRot * m[b].rotation;
+                Quaternion rot = alignRot * SafeMatrixRotation(m[b]);
                 m[b] = Matrix4x4.TRS(pos, rot, Vector3.one);
             }
 
@@ -701,6 +707,23 @@ namespace DeliriumRavenfield.Core
                     }
                 }
             }
+        }
+
+        private static Quaternion SafeMatrixRotation(Matrix4x4 mat)
+        {
+            Vector3 fwd = mat.GetColumn(2);
+            Vector3 up = mat.GetColumn(1);
+            if (fwd.sqrMagnitude > 1e-8f && up.sqrMagnitude > 1e-8f)
+            {
+                Vector3 cross = Vector3.Cross(up, fwd);
+                if (cross.sqrMagnitude > 1e-8f)
+                {
+                    Quaternion q = Quaternion.LookRotation(fwd.normalized, up.normalized);
+                    if (!float.IsNaN(q.x) && !float.IsNaN(q.y) && !float.IsNaN(q.z) && !float.IsNaN(q.w))
+                        return q;
+                }
+            }
+            return Quaternion.identity;
         }
 
         private static bool IsDescendantOf(int[] parents, int node, int ancestor)

@@ -1042,6 +1042,36 @@ namespace DeliriumRavenfield.Core
             return bestY;
         }
 
+        /// <summary>
+        /// Strict floor sampler for corpse-settling checks: casts straight down from just above the pelvis
+        /// and ignores steep/vertical wall surfaces (normal.y &lt; 0.55) so a ragdoll pressed against a wall
+        /// or ledge is never misclassified as lying on the floor and frozen mid-air.
+        /// </summary>
+        public float SampleFloorHeightBelow(Vector3 fromPos, Transform ignoreOwner, float fallbackY)
+        {
+            int mask = ~ignoredStaticLayersMask;
+            Vector3 origin = fromPos + Vector3.up * 0.18f;
+            var hits = Physics.RaycastAll(origin, Vector3.down, 12f, mask, QueryTriggerInteraction.Ignore);
+            float bestDist = float.MaxValue;
+            float bestY = fallbackY;
+            for (int i = 0; i < hits.Length; i++)
+            {
+                var h = hits[i];
+                if (h.collider == null || h.collider.isTrigger) continue;
+                if (ignoreOwner != null && h.transform.IsChildOf(ignoreOwner)) continue;
+                if (h.collider.attachedRigidbody != null && !h.collider.attachedRigidbody.isKinematic) continue;
+                if (h.collider.GetComponentInParent<Actor>() != null || h.collider.GetComponentInParent<Vehicle>() != null) continue;
+                if (h.normal.y < 0.55f) continue;
+                if (h.point.y > fromPos.y + 0.15f) continue;
+                if (h.distance < bestDist)
+                {
+                    bestDist = h.distance;
+                    bestY = h.point.y;
+                }
+            }
+            return bestY;
+        }
+
         private Collider SampleGroundCollider(Vector3 fromPos, Transform ignoreOwner)
         {
             int mask = ~ignoredStaticLayersMask;
