@@ -46,6 +46,10 @@ foreach ($w in $weroMatches) {
 New-Item -ItemType Directory -Force -Path $destDir | Out-Null
 Copy-Item -Force $modDll (Join-Path $destDir "DeliriumRavenfield.dll")
 Copy-Item -Force $nativeDll (Join-Path $destDir "delirium_physics.dll")
+$getupNet = Join-Path $DeliriumRepo "getup.net"
+if (Test-Path $getupNet) {
+    Copy-Item -Force $getupNet (Join-Path $destDir "getup.net")
+}
 
 Write-Host "=== Deployed successfully to $destDir ===" -ForegroundColor Green
 Get-ChildItem $destDir | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize

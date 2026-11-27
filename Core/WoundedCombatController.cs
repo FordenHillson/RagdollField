@@ -19,6 +19,7 @@ namespace DeliriumRavenfield.Core
         private float pointArmRefreshTimer;
 
         public bool IsShootingBurst => isCrawlingBurstPause;
+        public int CompletedBurstCount { get; private set; }
         public Vector3 CurrentAimTarget { get; private set; }
         public Vector3 CurrentCoverWaypoint { get; private set; }
 
@@ -37,8 +38,23 @@ namespace DeliriumRavenfield.Core
             isCrawlingBurstPause = false;
             isPointingArm = false;
             pointArmRefreshTimer = 0f;
+            CompletedBurstCount = 0;
             CurrentAimTarget = Vector3.zero;
             CurrentCoverWaypoint = Vector3.zero;
+        }
+
+        public bool HasUsableFirearm()
+        {
+            if (actor == null || actor.dead) return false;
+            if (ActorRagdollController.IsEligibleBlindFireWeapon(actor.activeWeapon)) return true;
+            if (actor.weapons == null) return false;
+            for (int slot = 0; slot < actor.weapons.Length; slot++)
+            {
+                Weapon cand = actor.weapons[slot];
+                if (ActorRagdollController.IsEligibleBlindFireWeapon(cand))
+                    return true;
+            }
+            return false;
         }
 
         public void RestoreActorFlags(BodyHealthState health)
@@ -142,7 +158,7 @@ namespace DeliriumRavenfield.Core
 
         public void TickGroundWounded(BodyHealthState health, IntPtr agent, IntPtr world, float dt, Vector3 pelvisPos, Transform ragdollRightHand, bool isStomachGroundClutch, bool allowFire)
         {
-            if (actor == null || health == null) return;
+            if (actor == null) return;
 
             actor.movementSpeedMultiplier = 0f;
             bool suppressWoundedAi = Plugin.LodManager != null && Plugin.LodManager.IsSuppressingWoundedCombat(actor);
@@ -154,13 +170,14 @@ namespace DeliriumRavenfield.Core
                 return;
             }
 
-            if (!isStomachGroundClutch)
+            if (!isStomachGroundClutch && health != null)
             {
                 TickCoverSeeking(health, dt);
                 CurrentCoverWaypoint = ResolveCrawlWaypoint(health, pelvisPos);
             }
 
-            if (allowFire && !health.RightArmRuined)
+            bool rightArmRuined = health != null && health.RightArmRuined;
+            if (allowFire && !rightArmRuined)
             {
                 EnsureOneHandedWeaponReady(health);
                 TickAimAndShoot(health, agent, world, dt, ragdollRightHand, isCrawling: !isStomachGroundClutch, isOnGroundClutch: isStomachGroundClutch);
@@ -168,6 +185,7 @@ namespace DeliriumRavenfield.Core
             else
             {
                 isCrawlingBurstPause = false;
+                CurrentAimTarget = Vector3.zero;
                 StopPointArm(agent, world);
             }
         }
@@ -268,7 +286,7 @@ namespace DeliriumRavenfield.Core
             {
                 needSidearm = true;
             }
-            else if (health.LeftArmRuined || health.StomachRuined || health.BothLegsRuined || health.AnyLegRuined)
+            else if (health != null && (health.LeftArmRuined || health.StomachRuined || health.BothLegsRuined || health.AnyLegRuined))
             {
                 // Heavy/anti-armor launchers or empty primary mag when off-hand is ruined -> prefer sidearm pistol if available
                 bool isHeavy = active.configuration != null &&
@@ -306,7 +324,14 @@ namespace DeliriumRavenfield.Core
         {
             var ai = actor.controller as AiActorController;
             Actor target = null;
-            if (ai != null)
+            Actor player = ActorManager.instance != null ? ActorManager.instance.player : null;
+            if (health != null && health.LastAttacker != null && !health.LastAttacker.dead && health.LastAttacker.team != actor.team)
+            {
+                float d2 = (health.LastAttacker.CenterPosition() - actor.CenterPosition()).sqrMagnitude;
+                if (d2 < 65f * 65f)
+                    target = health.LastAttacker;
+            }
+            if (target == null && ai != null)
             {
                 try
                 {
@@ -314,13 +339,14 @@ namespace DeliriumRavenfield.Core
                 }
                 catch { }
             }
-            if (target == null && health.LastAttacker != null && !health.LastAttacker.dead && health.LastAttacker.team != actor.team)
+            if (target == null && player != null && !player.dead && player.team != actor.team)
             {
-                float d2 = (health.LastAttacker.CenterPosition() - actor.CenterPosition()).sqrMagnitude;
-                if (d2 < 65f * 65f)
-                    target = health.LastAttacker;
+                float d2 = (player.CenterPosition() - actor.CenterPosition()).sqrMagnitude;
+                if (d2 < 55f * 55f)
+                    target = player;
             }
 
+            float weakness = health != null ? health.Weakness01 : 0f;
             Weapon w = actor.activeWeapon;
             bool hasMagAmmo = w != null && !w.reloading && w.ammo > 0 && w.HasLoadedAmmo();
             bool canUseWeapon = hasMagAmmo && ActorRagdollController.IsEligibleBlindFireWeapon(w);
@@ -333,6 +359,7 @@ namespace DeliriumRavenfield.Core
                 }
                 isCrawlingBurstPause = false;
                 burstShotsLeft = 0;
+                CurrentAimTarget = Vector3.zero;
                 StopPointArm(agent, world);
                 return;
             }
@@ -348,6 +375,7 @@ namespace DeliriumRavenfield.Core
             {
                 isCrawlingBurstPause = false;
                 burstShotsLeft = 0;
+                CurrentAimTarget = Vector3.zero;
                 StopPointArm(agent, world);
                 return;
             }
@@ -374,13 +402,13 @@ namespace DeliriumRavenfield.Core
             }
             else
             {
-                // Standing wounded or fallen stomach clutch: fire paced bursts continuously when enemy is visible
+                // Standing wounded or fallen ground aim: fire paced bursts continuously when enemy is visible
                 isCrawlingBurstPause = true;
                 if (burstShotsLeft <= 0 && burstStateTimer <= 0f)
                 {
                     burstShotsLeft = w.configuration.auto ? UnityEngine.Random.Range(2, 6) : UnityEngine.Random.Range(1, 3);
-                    burstStateTimer = UnityEngine.Random.Range(1.2f, 2.2f) * Mathf.Lerp(1f, 1.5f, health.Weakness01);
-                    nextShotTime = isOnGroundClutch ? 0.25f : 0.14f;
+                    burstStateTimer = UnityEngine.Random.Range(1.2f, 2.2f) * Mathf.Lerp(1f, 1.5f, weakness);
+                    nextShotTime = isOnGroundClutch ? 0.30f : 0.14f;
                 }
             }
 
@@ -390,16 +418,19 @@ namespace DeliriumRavenfield.Core
                 pointArmRefreshTimer -= dt;
                 if (!isPointingArm || pointArmRefreshTimer <= 0f)
                 {
-                    pointArmRefreshTimer = 0.08f;
+                    bool firstStart = !isPointingArm;
+                    pointArmRefreshTimer = 0.14f;
                     isPointingArm = true;
-                    float stiff = Mathf.Lerp(9.2f, 6.5f, health.Weakness01);
+                    float baseStiff = (isOnGroundClutch || isCrawling) ? 8.8f : 7.8f;
+                    float stiff = Mathf.Lerp(baseStiff, 6.5f, weakness);
                     nm_msg_begin(agent, "pointArm");
-                    nm_msg_set_bool(agent, "start", 1);
+                    if (firstStart)
+                        nm_msg_set_bool(agent, "start", 1);
                     nm_msg_set_bool(agent, "useLeftArm", 0);
                     nm_msg_set_vec3(agent, "target", ToNmVec(targetPos));
                     nm_msg_set_float(agent, "armStiffness", stiff);
-                    nm_msg_set_float(agent, "armDamping", 1.15f);
-                    nm_msg_set_float(agent, "armStraightness", 0.78f);
+                    nm_msg_set_float(agent, "armDamping", 1.55f);
+                    nm_msg_set_float(agent, "armStraightness", (isOnGroundClutch || isCrawling) ? 0.78f : 0.72f);
                     nm_msg_send(agent, world);
                 }
             }
@@ -415,9 +446,9 @@ namespace DeliriumRavenfield.Core
                 if (nextShotTime <= 0f)
                 {
                     Vector3 aimDir = (targetPos - myPos).normalized;
-                    float spreadDeg = 4.5f * config.WoundedSpreadMultiplier.Value * Mathf.Lerp(1f, 1.75f, health.Weakness01);
+                    float spreadDeg = 4.5f * config.WoundedSpreadMultiplier.Value * Mathf.Lerp(1f, 1.75f, weakness);
                     if (isCrawling || isOnGroundClutch) spreadDeg *= 1.35f;
-                    if (health.Condition == WoundedCondition.HoppingOneLeg) spreadDeg *= 1.25f;
+                    if (health != null && health.Condition == WoundedCondition.HoppingOneLeg) spreadDeg *= 1.25f;
 
                     Quaternion err = Quaternion.Euler(
                         UnityEngine.Random.Range(-spreadDeg, spreadDeg),
@@ -445,6 +476,8 @@ namespace DeliriumRavenfield.Core
                                 w.ammo = Mathf.Max(0, ammoBefore - 1);
 
                             burstShotsLeft--;
+                            if (burstShotsLeft <= 0)
+                                CompletedBurstCount++;
                             if (agent != IntPtr.Zero)
                             {
                                 var hp = new float[3];

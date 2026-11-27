@@ -205,15 +205,16 @@ namespace DeliriumRavenfield.Core
                 pelvisAdjusted = true;
             }
 
-            // Ensure Spine0..Spine3 [7..10] never collapse onto Buttocks [0] (zero-length Spine0 causes explosive joint launches!)
+            // Ensure Spine0..Spine3 [7..10] never collapse onto Buttocks [0] AND match Homer's balanced torso proportions
+            // (prevents bloated Spine0/Spine1 capsules colliding with hands and shrunken Spine3 chest!).
             float dxS0 = fitJoints[7 * 3 + 0] - fitJoints[0];
             float dyS0 = fitJoints[7 * 3 + 1] - fitJoints[1];
             float dzS0 = fitJoints[7 * 3 + 2] - fitJoints[2];
             float spine0Dist = Mathf.Sqrt(dxS0 * dxS0 + dyS0 * dyS0 + dzS0 * dzS0);
             if (pelvisAdjusted || spine0Dist < 0.07f)
             {
-                // Distribute Spine0..Spine3 along Buttocks [0] -> Neck [11] using Homer's anatomical proportions
-                float[] spineFracs = { 0.17f, 0.35f, 0.54f, 0.74f };
+                // Calibrated from Playroom Pistol 16-case benchmark: matches Homer's Spine0..Spine3 capsule lengths
+                float[] spineFracs = { 0.14f, 0.30f, 0.48f, 0.68f };
                 float nx = fitJoints[11 * 3 + 0], ny = fitJoints[11 * 3 + 1], nz = fitJoints[11 * 3 + 2];
                 for (int s = 0; s < 4; s++)
                 {
@@ -222,6 +223,39 @@ namespace DeliriumRavenfield.Core
                     fitJoints[idx + 0] = fitJoints[0] + (nx - fitJoints[0]) * f;
                     fitJoints[idx + 1] = fitJoints[1] + (ny - fitJoints[1]) * f;
                     fitJoints[idx + 2] = fitJoints[2] + (nz - fitJoints[2]) * f;
+                }
+            }
+
+            // Calibrate Neck [11] -> Head [12] vertical alignment: eliminates backward neck tilt in Soldier bind-pose
+            // that caused neck_upper / neck_lower to be the #1/#2 highest joint error (+18 deg) vs Playroom Homer!
+            {
+                float s3x = fitJoints[10 * 3 + 0], s3y = fitJoints[10 * 3 + 1], s3z = fitJoints[10 * 3 + 2];
+                float neckZ = fitJoints[11 * 3 + 2];
+                float headZ = fitJoints[12 * 3 + 2];
+                float neckToHeadZ = Mathf.Max(headZ - neckZ, 0.075f);
+                fitJoints[11 * 3 + 0] = s3x;
+                fitJoints[11 * 3 + 1] = s3y;
+                fitJoints[12 * 3 + 0] = s3x;
+                fitJoints[12 * 3 + 1] = s3y;
+                fitJoints[12 * 3 + 2] = neckZ + neckToHeadZ;
+            }
+
+            // Calibrate Clavicle [13]/[17] spacing when a skeleton places clavicles too close to shoulders (< 0.05m),
+            // matching Homer's 0.06m clavicle span so shoulder/wrist effectors don't over-strain during reachForWound!
+            {
+                float s3x = fitJoints[10 * 3 + 0], s3y = fitJoints[10 * 3 + 1];
+                foreach (var (clavIdx, armIdx) in new[] { (13, 14), (17, 18) })
+                {
+                    float dx = fitJoints[armIdx * 3 + 0] - fitJoints[clavIdx * 3 + 0];
+                    float dy = fitJoints[armIdx * 3 + 1] - fitJoints[clavIdx * 3 + 1];
+                    float dz = fitJoints[armIdx * 3 + 2] - fitJoints[clavIdx * 3 + 2];
+                    float clavLen = Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
+                    if (clavLen < 0.055f)
+                    {
+                        // Place clavicle at 38% from Spine3 centerline toward UpperArm socket
+                        fitJoints[clavIdx * 3 + 0] = Mathf.Lerp(s3x, fitJoints[armIdx * 3 + 0], 0.38f);
+                        fitJoints[clavIdx * 3 + 1] = Mathf.Lerp(s3y, fitJoints[armIdx * 3 + 1], 0.38f);
+                    }
                 }
             }
 
@@ -332,11 +366,15 @@ namespace DeliriumRavenfield.Core
             if (vparts.Count > 32)
             {
                 float skinKg = nm_build_weigh_skin(build, fitJoints, verts.ToArray(), vparts.ToArray(), vparts.Count);
-                if (skinKg < 55f || skinKg > 115f)
+                if (skinKg < 70f || skinKg > 110f)
                 {
-                    // Guard against blocky/unusual skins producing extreme mass
-                    nm_build_set_weight(build, Mathf.Clamp(fittedWeight, 68f, 92f));
+                    // Guard against lightweight (60kg) or blocky skins diverging from Playroom Homer's ~77.7kg balance mass
+                    nm_build_set_weight(build, Mathf.Clamp(fittedWeight * 1.25f, 74f, 92f));
                 }
+            }
+            else if (fittedWeight < 70f)
+            {
+                nm_build_set_weight(build, 76f);
             }
         }
 
@@ -682,17 +720,16 @@ namespace DeliriumRavenfield.Core
             // Raise the head capsule out of the jaw into the helmet/skull center and widen it to match low-poly helmets
             nm_build_set_head(build, 0.055f * scale, 1.38f);
 
-            // Enforce minimum capsule radii (metres at scale=1) matching Ravenfield's chunky mesh so fallen limbs/hands/vest never sink into floors.
-            // IMPORTANT: Do NOT inflate Shin L/R (parts 2 & 5) above ankle height (~0.058m) or both shins protrude below the feet
-            // and grind the ground while standing (cnt=108 instead of 72), causing backward drift & premature falls!
+            // Enforce balanced capsule radii (metres at scale=1) calibrated from 21-part Playroom Homer diff:
+            // thick enough to rest cleanly on floors without oversized arms/hands colliding into Spine0/Spine1 during reachForWound!
             var minRadii = new (int part, float minRad)[]
             {
-                (1, 0.092f), (4, 0.092f),   // Thigh L/R
-                (9, 0.122f), (10, 0.130f),  // Spine2, Spine3 (armored chest vest)
-                (11, 0.072f),               // Neck
-                (14, 0.076f), (18, 0.076f), // Upper Arm L/R
-                (15, 0.068f), (19, 0.068f), // Lower Arm L/R
-                (16, 0.058f), (20, 0.058f), // Hand L/R (up from 0.017m!)
+                (1, 0.088f), (4, 0.088f),   // Thigh L/R (Homer: 0.086)
+                (9, 0.116f), (10, 0.124f),  // Spine2, Spine3 (Homer: 0.110 / 0.122)
+                (11, 0.068f),               // Neck (Homer: 0.066)
+                (14, 0.058f), (18, 0.058f), // Upper Arm L/R (Homer: 0.045)
+                (15, 0.050f), (19, 0.050f), // Lower Arm L/R (Homer: 0.043)
+                (16, 0.036f), (20, 0.036f), // Hand L/R (Homer: 0.020; prevents self-collision while still resting on floor)
             };
             var curRad = new float[1];
             for (int i = 0; i < minRadii.Length; i++)
@@ -702,6 +739,15 @@ namespace DeliriumRavenfield.Core
                 if (nm_build_part_info(build, p, null, curRad, null, out _) >= 0 && curRad[0] * scale < want)
                 {
                     nm_build_set_part_radius(build, p, want);
+                }
+            }
+            // Cap bloated lower-spine radii (Spine0/Spine1) so forearms don't bounce off the waist when clutching stomach/chest
+            foreach (int sp in new[] { 7, 8 })
+            {
+                float maxWaist = 0.122f * scale;
+                if (nm_build_part_info(build, sp, null, curRad, null, out _) >= 0 && curRad[0] * scale > maxWaist)
+                {
+                    nm_build_set_part_radius(build, sp, maxWaist);
                 }
             }
         }

@@ -282,6 +282,10 @@ namespace DeliriumRavenfield.UI
             GUILayout.BeginHorizontal();
             config.EnableSurrenderAiIgnore.Value = GUILayout.Toggle(config.EnableSurrenderAiIgnore.Value, "Surrender AI Ignore");
             config.EnableMedkitStopBleed.Value = GUILayout.Toggle(config.EnableMedkitStopBleed.Value, "Medkit Stops Bleed");
+            config.EnableDownedFightBack.Value = GUILayout.Toggle(config.EnableDownedFightBack.Value, "Downed Shoot");
+            config.EnableDownedBreathing.Value = GUILayout.Toggle(config.EnableDownedBreathing.Value, "Breathing");
+            config.EnablePureDeliriumGetUp.Value = GUILayout.Toggle(config.EnablePureDeliriumGetUp.Value, "Delirium GetUp");
+            config.UsePlayroomHomerModel.Value = GUILayout.Toggle(config.UsePlayroomHomerModel.Value, "Homer Model");
             GUILayout.EndHorizontal();
 
             // Aimed target diagnostics & Locational Wound Test Buttons
@@ -403,6 +407,8 @@ namespace DeliriumRavenfield.UI
             config.BleedRateArm.Value = DrawSlider("Bleed Arm (/s)", config.BleedRateArm.Value, 1f, 20f);
             config.BleedRateStomach.Value = DrawSlider("Bleed Stomach (/s)", config.BleedRateStomach.Value, 1f, 25f);
             config.WoundedSpreadMultiplier.Value = DrawSlider("Wounded Spread", config.WoundedSpreadMultiplier.Value, 1f, 5f);
+            config.DownedFightBackChance.Value = DrawSlider("Downed Fight %", config.DownedFightBackChance.Value, 0f, 1f);
+            config.DownedBreathingIntensity.Value = DrawSlider("Breathing Scale", config.DownedBreathingIntensity.Value, 0.2f, 2.5f);
             config.BleedingFinishHitsMin.Value = Mathf.RoundToInt(DrawSlider("Bleed Finish Min", config.BleedingFinishHitsMin.Value, 1f, 6f));
             config.BleedingFinishHitsMax.Value = Mathf.RoundToInt(DrawSlider("Bleed Finish Max", Mathf.Max(config.BleedingFinishHitsMax.Value, config.BleedingFinishHitsMin.Value), 1f, 6f));
 

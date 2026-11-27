@@ -11,6 +11,7 @@ namespace DeliriumRavenfield.Core
         Animated,
         ActiveStagger,
         ActiveFallen,
+        PhysicsGetUp,
         BlendingToStand,
         WoundedStanding,
         WoundedCrawling,
@@ -45,6 +46,7 @@ namespace DeliriumRavenfield.Core
             Agent != IntPtr.Zero &&
             (Phase == RagdollPhase.ActiveStagger ||
              Phase == RagdollPhase.ActiveFallen ||
+             Phase == RagdollPhase.PhysicsGetUp ||
              Phase == RagdollPhase.WoundedStanding ||
              Phase == RagdollPhase.WoundedCrawling ||
              Phase == RagdollPhase.Surrendering ||
@@ -54,6 +56,7 @@ namespace DeliriumRavenfield.Core
         public bool SuppressMovement =>
             Phase == RagdollPhase.ActiveStagger ||
             Phase == RagdollPhase.ActiveFallen ||
+            Phase == RagdollPhase.PhysicsGetUp ||
             Phase == RagdollPhase.BlendingToStand ||
             Phase == RagdollPhase.WoundedCrawling ||
             Phase == RagdollPhase.Surrendering;
@@ -61,6 +64,7 @@ namespace DeliriumRavenfield.Core
         public bool SuppressWeaponFire =>
             Phase == RagdollPhase.ActiveStagger ||
             Phase == RagdollPhase.ActiveFallen ||
+            Phase == RagdollPhase.PhysicsGetUp ||
             Phase == RagdollPhase.BlendingToStand ||
             Phase == RagdollPhase.WoundedStanding ||
             Phase == RagdollPhase.WoundedCrawling ||
@@ -76,6 +80,7 @@ namespace DeliriumRavenfield.Core
         public bool SuppressVanillaGetUp =>
             Phase == RagdollPhase.ActiveStagger ||
             Phase == RagdollPhase.ActiveFallen ||
+            Phase == RagdollPhase.PhysicsGetUp ||
             Phase == RagdollPhase.WoundedStanding ||
             Phase == RagdollPhase.WoundedCrawling ||
             Phase == RagdollPhase.Surrendering;
@@ -101,6 +106,7 @@ namespace DeliriumRavenfield.Core
         private float[] frameBuf;
         private readonly List<Rigidbody> kinematicBodies = new List<Rigidbody>();
         private readonly EnginePhysicsProxy enginePhysicsProxy = new EnginePhysicsProxy();
+        private readonly HomerVisualBody homerVisual = new HomerVisualBody();
 
         // State timers
         private float staggerElapsed;
@@ -170,11 +176,16 @@ namespace DeliriumRavenfield.Core
         private string partialKeyframeMask;
         private float hopBouncePhase;
         private Transform trackedWeaponParent;
+        private Transform weaponParentSavedParent;
         private Transform weaponRagdollHand;
         private Vector3 weaponParentSavedLocalPos;
         private Quaternion weaponParentSavedLocalRot;
+        private Vector3 weaponParentSavedLocalScale = Vector3.one;
         private Vector3 weaponHandOffsetPos;
-        private Quaternion weaponHandOffsetRot;
+        private Quaternion weaponHandOffsetRot = Quaternion.identity;
+        private bool hasCachedWeaponGripOffset;
+        private Vector3 cachedWeaponGripPos;
+        private Quaternion cachedWeaponGripRot = Quaternion.identity;
         private bool weaponAttachedToRagdoll;
         private bool weaponHiddenByFallback;
 
@@ -183,12 +194,36 @@ namespace DeliriumRavenfield.Core
         private int blindFireDeferredSlot = -1;
         private bool blindFirePendingStart;
         private bool blindFireActive;
+        private bool blindFireForcesFall;
+        private bool blindFireTriggeredThisStagger;
         private float blindFireElapsed;
         private float blindFireDuration;
         private float blindFireNextShotTime;
         private int blindFireShotsFired;
         private int blindFireMaxShots;
         private Quaternion blindFireTwitchRot = Quaternion.identity;
+
+        // Downed random roll: aim & shoot (supine sit-up / prone push-up) vs natural ground writhing/clutching
+        private bool downedFightBackRolled;
+        private bool downedFightBackActive;
+        private float downedFightBackElapsed;
+        private int downedFightBackMaxBursts;
+        private float downedWritheDuration;
+        private bool activeFallenBehaviorActive;
+
+        // Subtle downed chest breathing animation (localScale on Chest/UpperChest bones)
+        private int[] chestBoneIndices;
+        private Vector3[] chestBaseLocalScales;
+        private float breathingPhase;
+        private float breathingWeight;
+
+        // Pure-Delirium physics get-up (getup.net + procedural upright assist fallback)
+        private static string resolvedGetUpNetPath;
+        private static bool getUpNetPathChecked;
+        private float physicsGetUpElapsed;
+        private float physicsGetUpStandingElapsed;
+        private bool physicsGetUpFallbackActive;
+        private float physicsGetUpFallbackElapsed;
 
         // Smooth blend from gun-holding/aiming animation INTO Delirium stagger (eliminates 1-frame snap)
         private Quaternion entryStartRootRot;
@@ -201,6 +236,7 @@ namespace DeliriumRavenfield.Core
         private bool hasIncomingArmFollow;
 
         // Smooth blend back to standing animation (for alive bots that recovered without falling)
+        private Transform animBlendHips;
         private Transform[] animBlendBones;
         private Quaternion[] animBlendStartRot;
         private Vector3 animBlendStartHipPos;
@@ -244,6 +280,7 @@ namespace DeliriumRavenfield.Core
                 // 2. Freeze Unity PhysX rigidbodies on ragdollObject so ConfigurableJoints never fight Delirium
                 FreezeRagdollRigidbodies();
                 EnsureRagdollCollidersEnabled();
+                EnsureRagdollRenderersNeverCull();
 
                 // Sample ground height ONCE and use the exact same groundY for rig build, world, and agent creation
                 Physics.SyncTransforms();
@@ -260,8 +297,20 @@ namespace DeliriumRavenfield.Core
 
                 hips = rigBuild.Hips;
                 bones = rigBuild.Bones;
-                build = rigBuild.Build;
-                scale = rigBuild.Scale;
+                bool usePlayroomHomer = config.UsePlayroomHomerModel.Value && !IsPlayer;
+                if (usePlayroomHomer)
+                {
+                    if (rigBuild.Build != IntPtr.Zero) nm_build_destroy(rigBuild.Build);
+                    build = runtime.BaseBuild;
+                    buildOwnedByController = false;
+                    scale = 1f;
+                }
+                else
+                {
+                    build = rigBuild.Build;
+                    buildOwnedByController = true;
+                    scale = rigBuild.Scale;
+                }
                 LastRigReport = rigBuild.CheckReport ?? "";
                 LastRigSnapshot = rigBuild;
                 CachePartMasses();
@@ -278,7 +327,28 @@ namespace DeliriumRavenfield.Core
 
                 ApplyAgentConfig();
 
-                rig = nm_rig_create(Agent, bones.Length, rigBuild.Parents, rigBuild.RestFrames, rigBuild.Parts);
+                float[] restForRig = rigBuild.RestFrames;
+                if (usePlayroomHomer)
+                {
+                    restForRig = new float[rigBuild.RestFrames.Length];
+                    Array.Copy(rigBuild.RestFrames, restForRig, restForRig.Length);
+                    var p0 = new float[3];
+                    if (nm_agent_get_part_transform(Agent, 0, p0, null) >= 0)
+                    {
+                        int hipsBoneIdx = 0;
+                        for (int bi = 0; bi < rigBuild.Parts.Length; bi++)
+                            if (rigBuild.Parts[bi] == 0) { hipsBoneIdx = bi; break; }
+                        float dx = p0[0] - restForRig[hipsBoneIdx * 7 + 0];
+                        float dy = p0[1] - restForRig[hipsBoneIdx * 7 + 1];
+                        for (int bi = 0; bi < bones.Length; bi++)
+                        {
+                            restForRig[bi * 7 + 0] += dx;
+                            restForRig[bi * 7 + 1] += dy;
+                        }
+                    }
+                }
+
+                rig = nm_rig_create(Agent, bones.Length, rigBuild.Parents, restForRig, rigBuild.Parts);
                 if (rig == IntPtr.Zero)
                     throw new Exception($"nm_rig_create failed: {LastError()}");
 
@@ -291,10 +361,20 @@ namespace DeliriumRavenfield.Core
                     if (bones[bi] == null) continue;
                     try { animatedBones[bi] = Actor.ragdoll.RagdollToAnimated(bones[bi]); } catch { }
                 }
+                CacheChestBonesForBreathing(rigBuild.Parts);
 
                 // 6. Seamless takeover from current Unity pose & velocity (zero snap!)
                 CaptureCurrentFrames(frameBuf);
                 Check(nm_rig_take(rig, Agent, frameBuf, null, 0f), "nm_rig_take");
+
+                if (usePlayroomHomer)
+                {
+                    homerVisual.Build(Actor, Agent, build, scale);
+                }
+                else
+                {
+                    homerVisual.Dispose();
+                }
 
                 // 6b. Build Delirium EnginePhysics kinematic colliders for Unity prop/trigger interaction
                 if (config.EnableEnginePhysicsColliders.Value)
@@ -334,12 +414,22 @@ namespace DeliriumRavenfield.Core
                 worldReanchorCooldown = 0.5f;
                 ResetDyingStaggerState();
                 ResetDeathAgonyState();
+                ResetDownedFightBackState();
+                blindFireForcesFall = false;
+                blindFireTriggeredThisStagger = false;
                 burstImpulseUsed = 0f;
                 lastShotTaskTime = -10f;
                 lastShotHitTime = -10f;
                 consecutiveRapidHits = 0;
                 consecutiveAliveHits = 0;
                 BracingVehicleIndex = -1;
+
+                // Capture clean standing grip offset right away before Animator/ragdoll layers diverge
+                if (!Actor.dead && !wasFallenBeforeTakeover && !IsPlayer)
+                {
+                    CaptureWeaponForRagdollHand(allowDeadWeapon: false);
+                    RestoreWeaponParentTransform();
+                }
 
                 if (Actor.dead)
                 {
@@ -632,6 +722,10 @@ namespace DeliriumRavenfield.Core
             }
 
             // Check phase BEFORE EnsureTakenOver so 1-shot kills, DyingStagger follow-ups, and DeadFrozen wakes are distinguished cleanly!
+            if (Phase == RagdollPhase.PhysicsGetUp)
+            {
+                CancelPhysicsGetUp(fallIfLow: true);
+            }
             bool wasInDyingStagger = Phase == RagdollPhase.DyingStagger;
             bool wasFrozen = Phase == RagdollPhase.DeadFrozen;
             bool wasAlreadyDead = !wasInDyingStagger && (alreadyDeadCorpse || Phase == RagdollPhase.DeadSimulating || wasFrozen);
@@ -814,6 +908,11 @@ namespace DeliriumRavenfield.Core
             if (Actor == null || health == null) return;
             HealthState = health;
 
+            if (Phase == RagdollPhase.PhysicsGetUp)
+            {
+                CancelPhysicsGetUp(fallIfLow: true);
+            }
+
             if (IsSyncLockstepControlled && Plugin.PlayroomSync != null && Plugin.PlayroomSync.IsConnected)
             {
                 Plugin.PlayroomSync.ForwardShot(this, info, outcome.Lethal, outcome, health);
@@ -874,7 +973,7 @@ namespace DeliriumRavenfield.Core
                     MarkDead(keepEntryBlend: true, keepEnvReactions: false);
                     StartNaturalDeathCollapse();
                     ScheduleDeathAgonyIfEligible(outcome.Part, isCriticalOrHeadshot: false, isExplosion: false);
-                    float imp = ConsumeBurstBudget(shot.TotalImpulse * 1.1f);
+                    float imp = ConsumeBurstBudget(Mathf.Max(shot.TotalImpulse * 1.1f, wasStandingBeforeShot ? 18f : 0f));
                     ApplyNaturalDistributedImpulse(outcome.Part, point, shot.Direction, imp, out float fLocal, out float fTorso);
                     WeaponForceNormalizer.RecordTelemetry(shot, imp, fLocal, fTorso, outcome.Part);
                 }
@@ -981,6 +1080,10 @@ namespace DeliriumRavenfield.Core
             aliveStaggerDir = shot.Direction;
             aliveLeanAmount = Mathf.Lerp(0.45f, 0.95f, shot.Power01);
             pendingWoundedTransitionTimer = health.IsWounded ? 0.65f : 0f;
+            if (!isGroundCondition && !wasGroundPhase && !health.RightArmRuined && !blindFireActive && !blindFireTriggeredThisStagger)
+            {
+                TryTriggerReflexBlindFire(isDeathShot: false);
+            }
         }
 
         private bool now_should_stagger(float rawDmg)
@@ -1178,6 +1281,7 @@ namespace DeliriumRavenfield.Core
                 case WoundedCondition.CrawlingTwoLegs:
                 {
                     ClearPartialKeyframe();
+                    EnsureDownedBehaviorRolled(isIncapacitated: true);
                     if (activeWoundedBehavior != "woundedCrawl")
                     {
                         StopActiveWoundedBehavior();
@@ -1187,7 +1291,7 @@ namespace DeliriumRavenfield.Core
                         nm_msg_set_bool(Agent, "deadRightLeg", health.RightLegRuined ? 1 : 0);
                         nm_msg_set_bool(Agent, "leftArmInjured", health.LeftArmRuined ? 1 : 0);
                         nm_msg_set_vec3(Agent, "targetPosition", ToNmVec(anchor + facing * 6f));
-                        nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(threat));
+                        nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(downedFightBackActive ? threat : Vector3.zero));
                         nm_msg_set_bool(Agent, "shooting", 0);
                         nm_msg_set_float(Agent, "speed", health.BothLegsRuined ? 0.75f : 0.95f);
                         nm_msg_set_float(Agent, "weakness", health.Weakness01);
@@ -1195,7 +1299,8 @@ namespace DeliriumRavenfield.Core
                         nm_msg_send(Agent, WorldEntry.World);
                         activeWoundedBehavior = "woundedCrawl";
                     }
-                    EnsureWeaponVisibleInRagdollHand();
+                    if (downedFightBackActive)
+                        EnsureWeaponVisibleInRagdollHand();
                     Phase = RagdollPhase.WoundedCrawling;
                     break;
                 }
@@ -1204,18 +1309,21 @@ namespace DeliriumRavenfield.Core
                 {
                     ClearPartialKeyframe();
                     StopActiveWoundedBehavior();
+                    EnsureDownedBehaviorRolled(isIncapacitated: true);
                     nm_msg_begin(Agent, "woundedClutch");
                     nm_msg_set_bool(Agent, "start", 1);
                     nm_msg_set_int(Agent, "woundPart", health.PrimaryTorsoWoundPart);
                     nm_msg_set_bool(Agent, "onGround", 1);
-                    nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(threat));
+                    nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(downedFightBackActive ? threat : Vector3.zero));
                     nm_msg_set_float(Agent, "weakness", health.Weakness01);
                     nm_msg_set_bool(Agent, "useLeftArm", health.LeftArmRuined ? 0 : 1);
+                    nm_msg_set_bool(Agent, "writhing", downedFightBackActive ? 0 : 1);
                     nm_msg_set_float(Agent, "groundZ", safeGroundY);
                     nm_msg_send(Agent, WorldEntry.World);
 
                     activeWoundedBehavior = "woundedClutch";
-                    EnsureWeaponVisibleInRagdollHand();
+                    if (downedFightBackActive)
+                        EnsureWeaponVisibleInRagdollHand();
                     Phase = RagdollPhase.WoundedCrawling;
                     break;
                 }
@@ -1376,7 +1484,8 @@ namespace DeliriumRavenfield.Core
             {
                 bool isStomachClutch = health.Condition == WoundedCondition.FallenStomachClutch;
                 Vector3 pelvisPos = hips != null ? hips.position : lastComPos;
-                woundedCombat.TickGroundWounded(health, Agent, WorldEntry.World, dt, pelvisPos, weaponRagdollHand, isStomachClutch, allowFire: !testRangeIdle);
+                bool allowDownedFire = !testRangeIdle && downedFightBackActive;
+                woundedCombat.TickGroundWounded(health, Agent, WorldEntry.World, dt, pelvisPos, weaponRagdollHand, isStomachClutch, allowFire: allowDownedFire);
 
                 float safeGroundY = runtime.SampleGroundHeight(pelvisPos + Vector3.up * 0.35f, Actor.transform, pelvisPos.y - 0.15f);
 
@@ -1404,20 +1513,20 @@ namespace DeliriumRavenfield.Core
                     nm_msg_set_bool(Agent, "leftArmInjured", health.LeftArmRuined ? 1 : 0);
                     if (woundedCombat.CurrentCoverWaypoint != Vector3.zero)
                         nm_msg_set_vec3(Agent, "targetPosition", ToNmVec(woundedCombat.CurrentCoverWaypoint));
-                    if (woundedCombat.CurrentAimTarget != Vector3.zero)
-                        nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(woundedCombat.CurrentAimTarget));
-                    nm_msg_set_bool(Agent, "shooting", woundedCombat.IsShootingBurst ? 1 : 0);
+                    nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(allowDownedFire ? woundedCombat.CurrentAimTarget : Vector3.zero));
+                    nm_msg_set_bool(Agent, "shooting", (allowDownedFire && woundedCombat.IsShootingBurst) ? 1 : 0);
                     nm_msg_set_float(Agent, "weakness", health.Weakness01);
                     nm_msg_set_float(Agent, "groundZ", safeGroundY);
                     nm_msg_send(Agent, WorldEntry.World);
                 }
                 else if (activeWoundedBehavior == "woundedClutch")
                 {
+                    bool aimingNow = allowDownedFire && woundedCombat.CurrentAimTarget != Vector3.zero;
                     nm_msg_begin(Agent, "woundedClutch");
-                    if (woundedCombat.CurrentAimTarget != Vector3.zero)
-                        nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(woundedCombat.CurrentAimTarget));
+                    nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(aimingNow ? woundedCombat.CurrentAimTarget : Vector3.zero));
                     nm_msg_set_float(Agent, "weakness", health.Weakness01);
                     nm_msg_set_bool(Agent, "useLeftArm", health.LeftArmRuined ? 0 : 1);
+                    nm_msg_set_bool(Agent, "writhing", aimingNow ? 0 : 1);
                     nm_msg_set_float(Agent, "groundZ", safeGroundY);
                     nm_msg_send(Agent, WorldEntry.World);
                 }
@@ -1529,6 +1638,10 @@ namespace DeliriumRavenfield.Core
 
         public void ApplyMelee(DamageInfo info, bool fatal)
         {
+            if (Phase == RagdollPhase.PhysicsGetUp)
+            {
+                CancelPhysicsGetUp(fallIfLow: true);
+            }
             if (IsSyncLockstepControlled && Plugin.PlayroomSync != null && Plugin.PlayroomSync.IsConnected)
             {
                 Plugin.PlayroomSync.ForwardMelee(this, info, fatal);
@@ -1604,6 +1717,10 @@ namespace DeliriumRavenfield.Core
 
         public void ApplyExplosion(Vector3 origin, float radius, float rawForceOrSpeed, bool fatal, bool isAlreadyNormalizedSpeed = false)
         {
+            if (Phase == RagdollPhase.PhysicsGetUp)
+            {
+                CancelPhysicsGetUp(fallIfLow: false);
+            }
             if (IsSyncLockstepControlled && Plugin.PlayroomSync != null && Plugin.PlayroomSync.IsConnected)
             {
                 Plugin.PlayroomSync.ForwardExplosion(this, origin, radius, rawForceOrSpeed, fatal, isAlreadyNormalizedSpeed);
@@ -1770,6 +1887,11 @@ namespace DeliriumRavenfield.Core
 
         public void MarkDead(bool keepEntryBlend = false, bool keepEnvReactions = false)
         {
+            CancelPhysicsGetUp(fallIfLow: false);
+            ClearPartialKeyframe();
+            StopActiveWoundedBehavior();
+            if (Agent != IntPtr.Zero && WorldEntry != null)
+                woundedCombat.StopPointArm(Agent, WorldEntry.World);
             if (!blindFirePendingStart && !blindFireActive)
                 RestoreWeaponParentTransform();
             ClearIncomingArmFollow();
@@ -1777,6 +1899,11 @@ namespace DeliriumRavenfield.Core
                 entryBlendDuration = 0f;
             if (Agent != IntPtr.Zero)
             {
+                // Always unkeyframe all body parts on death so pelvis/legs can NEVER remain pinned upright!
+                nm_agent_keyframe(Agent, "fb", 0);
+                if (rig != IntPtr.Zero)
+                    nm_rig_incoming(rig, Agent, null);
+
                 if (keepEnvReactions)
                 {
                     nm_agent_set_dead(Agent, 0);
@@ -1838,6 +1965,8 @@ namespace DeliriumRavenfield.Core
             if (Agent == IntPtr.Zero || WorldEntry == null) return;
             // Stage 2: relax 99% with low damping (0.12x) and holdPose=true so even the 0.01% residual
             // stiffness never pulls limbs back toward A-pose; body drapes completely naturally on the floor.
+            ClearPartialKeyframe();
+            nm_agent_keyframe(Agent, "fb", 0);
             dyingCollapseActive = false;
             nm_agent_task_stop(Agent);
             nm_msg_send_text(Agent, WorldEntry.World, "stopAllBehaviours");
@@ -1897,6 +2026,8 @@ namespace DeliriumRavenfield.Core
             if (Actor.dead && Phase != RagdollPhase.DeadSimulating && Phase != RagdollPhase.DyingStagger)
             {
                 MarkDead();
+                GoFullyLimp();
+                deadRelaxed = true;
             }
 
             // Read COM position & velocity for state logic and diagnostics
@@ -2012,12 +2143,24 @@ namespace DeliriumRavenfield.Core
             if (Phase == RagdollPhase.DeadSimulating)
             {
                 deadElapsed += dt;
-                bool deadFallen = nm_agent_has_fallen(Agent) == 1;
+                float groundY = hips != null
+                    ? runtime.SampleGroundHeight(hips.position + Vector3.up * 0.4f, Actor.transform, hips.position.y - 4f)
+                    : lastComPos.y - 1f;
+                float hipsHeightAboveGround = hips != null ? (hips.position.y - groundY) : 0f;
+                float headHeightAboveGround = hipsHeightAboveGround;
+                var deadHeadPos = new float[3];
+                if (nm_agent_get_part_transform(Agent, 12, deadHeadPos, null) >= 0)
+                    headHeightAboveGround = ToUnityVec(deadHeadPos).y - groundY;
+
+                // Measure real height of BOTH hips and head above floor so a crouching/squatting/wall-leaning corpse
+                // is NEVER mistakenly treated as lying flat on the floor and frozen upright!
+                bool onGroundOrLow = hipsHeightAboveGround < 0.46f * scale && headHeightAboveGround < 0.65f * scale;
+                bool verticalSettled = Mathf.Abs(lastComVel.y) < 0.18f;
 
                 // Muscle-driven dying collapse phase: weakened catchFall + NM_XR_WALL/LEDGE/stairs active while going down
                 if (dyingCollapseActive)
                 {
-                    bool hitFloor = (deadElapsed >= 0.45f && (deadFallen || lastComVel.magnitude < 1.25f)) || deadElapsed >= 0.90f;
+                    bool hitFloor = (deadElapsed >= 0.45f && onGroundOrLow) || deadElapsed >= 1.15f;
                     if (!hitFloor)
                     {
                         return;
@@ -2030,8 +2173,8 @@ namespace DeliriumRavenfield.Core
                 {
                     if (!deathAgonyActive)
                     {
-                        bool landed = (deadElapsed >= 0.45f && (deadFallen || lastComVel.magnitude < 1.35f)) || deadElapsed >= 0.75f;
-                        if (landed)
+                        // Wait until corpse actually reaches the floor before starting ground agony!
+                        if (onGroundOrLow && deadElapsed >= 0.35f)
                         {
                             deathAgonyActive = true;
                             deathAgonyElapsed = 0f;
@@ -2040,6 +2183,11 @@ namespace DeliriumRavenfield.Core
                             ApplyDeathAgonyWave(0f);
                             if (config.DebugLog.Value)
                                 Plugin.Log.LogInfo($"[Delirium] Death agony started for {Actor.name} (style={deathAgonyStyle}, dur={deathAgonyDuration:F2}s)");
+                        }
+                        else if (deadElapsed >= 1.8f && !onGroundOrLow)
+                        {
+                            // Still falling or snagged upright -> cancel agony and go fully limp so gravity drops them
+                            CancelDeathAgonyAndGoLimp();
                         }
                         return;
                     }
@@ -2062,7 +2210,7 @@ namespace DeliriumRavenfield.Core
                 }
 
                 // Transition from Stage 1 dying crumple into Stage 2 full 99% floppy limp
-                if (!deadRelaxed && ((deadFallen && deadElapsed >= 0.25f) || deadElapsed >= 0.32f))
+                if (!deadRelaxed && ((onGroundOrLow && deadElapsed >= 0.25f) || deadElapsed >= 0.32f))
                 {
                     GoFullyLimp();
                     deadRelaxed = true;
@@ -2071,17 +2219,26 @@ namespace DeliriumRavenfield.Core
                     deadStillElapsed = 0f;
                 }
 
-                float hardFreezeLimit = 6.0f + (deathAgonyDone ? deathAgonyDuration : 0f);
+                float hardFreezeLimit = 8.0f + (deathAgonyDone ? deathAgonyDuration : 0f);
                 if (deadRelaxed)
                 {
                     bool resting = nm_agent_is_resting(Agent, WorldEntry.World) == 1;
-                    if (resting || lastComVel.magnitude < config.FreezeDeadVelocityThreshold.Value)
+
+                    // Prevent dead corpses from staying balanced upright, squatting, or propped against a wall
+                    if (!onGroundOrLow && deadElapsed >= 0.40f && lastComVel.magnitude < 0.40f && (hipsHeightAboveGround > 0.48f * scale || headHeightAboveGround > 0.68f * scale))
+                    {
+                        Vector3 slumpDir = (Actor.transform.forward * (UnityEngine.Random.value < 0.5f ? 1f : -1f) + Actor.transform.right * UnityEngine.Random.Range(-0.75f, 0.75f)).normalized;
+                        Vector3 at = hips != null ? hips.position + Vector3.up * 0.35f : lastComPos;
+                        ApplyNaturalDistributedImpulse(10, at, slumpDir, 22f, out _, out _);
+                    }
+
+                    if (onGroundOrLow && verticalSettled && (resting || lastComVel.magnitude < config.FreezeDeadVelocityThreshold.Value))
                         deadStillElapsed += dt;
                     else
                         deadStillElapsed = 0f;
 
-                    // Displacement-based settling: freezes corpses cleanly even if contact micro-jitter spikes instantaneous v
-                    if ((lastComPos - deadAnchorPos).sqrMagnitude < 0.08f * 0.08f)
+                    // Displacement-based settling: ONLY count while actually on/near the ground and not falling!
+                    if (onGroundOrLow && verticalSettled && (lastComPos - deadAnchorPos).sqrMagnitude < 0.08f * 0.08f)
                     {
                         deadAnchorElapsed += dt;
                     }
@@ -2091,15 +2248,18 @@ namespace DeliriumRavenfield.Core
                         deadAnchorElapsed = 0f;
                     }
 
-                    if (resting ||
-                        deadStillElapsed >= config.FreezeDeadAfterSeconds.Value ||
-                        deadAnchorElapsed >= 1.4f ||
-                        deadElapsed >= hardFreezeLimit)
+                    bool canNormalFreeze = onGroundOrLow && verticalSettled && deadElapsed >= 0.90f &&
+                        (deadStillElapsed >= config.FreezeDeadAfterSeconds.Value ||
+                         deadAnchorElapsed >= 1.4f ||
+                         (resting && deadStillElapsed >= 0.45f));
+                    bool canHardFreeze = deadElapsed >= hardFreezeLimit && verticalSettled && (onGroundOrLow || deadElapsed >= hardFreezeLimit + 4.0f);
+
+                    if (canNormalFreeze || canHardFreeze)
                     {
                         FreezeDeadCorpse();
                     }
                 }
-                else if (deadElapsed >= hardFreezeLimit)
+                else if (deadElapsed >= hardFreezeLimit && verticalSettled && onGroundOrLow)
                 {
                     FreezeDeadCorpse();
                 }
@@ -2150,6 +2310,10 @@ namespace DeliriumRavenfield.Core
                     return;
                 }
 
+                // While startled blind-fire is actively discharging its 2-4 shots, let it finish before transitioning or recovering
+                if (blindFireActive)
+                    return;
+
                 // After a rapid-fire burst pauses while still standing wounded, smoothly enter WoundedStanding!
                 if (pendingWoundedTransitionTimer > 0f)
                 {
@@ -2182,10 +2346,108 @@ namespace DeliriumRavenfield.Core
                 fallenElapsed += dt;
 
                 // If somehow recovered onto feet without falling, allow stand recovery
-                if (!hasFallen && settled && !wasFallenBeforeTakeover)
+                if (!hasFallen && settled && !wasFallenBeforeTakeover && !activeFallenBehaviorActive)
                 {
                     BeginBlendBackToStanding();
                     return;
+                }
+
+                // Wait briefly (~0.35s) to settle onto the floor, then run rolled downed fight-back (supine/prone aim) OR natural writhing
+                if (!IsPlayer && fallenElapsed >= 0.35f && !blindFireActive)
+                {
+                    EnsureDownedBehaviorRolled(isIncapacitated: false);
+                    bool testRangeIdle = Plugin.LodManager != null && Plugin.LodManager.TestRangeMode;
+                    Vector3 pelvisPos = hips != null ? hips.position : lastComPos;
+                    float safeGroundY = runtime.SampleGroundHeight(pelvisPos + Vector3.up * 0.35f, Actor.transform, pelvisPos.y - 0.15f);
+                    float weakness = HealthState != null ? HealthState.Weakness01 : 0.15f;
+                    int woundPart = HealthState != null ? HealthState.LastHitPart : 8;
+
+                    if (downedFightBackActive && !testRangeIdle)
+                    {
+                        downedFightBackElapsed += dt;
+                        EnsureWeaponVisibleInRagdollHand();
+                        woundedCombat.TickGroundWounded(HealthState, Agent, WorldEntry.World, dt, pelvisPos, weaponRagdollHand, isStomachGroundClutch: true, allowFire: true);
+
+                        bool hasTarget = woundedCombat.CurrentAimTarget != Vector3.zero;
+                        if (!activeFallenBehaviorActive)
+                        {
+                            nm_agent_task_stop(Agent);
+                            fallenTaskStopped = true;
+                            activeFallenBehaviorActive = true;
+                            activeWoundedBehavior = "woundedClutch";
+                            nm_msg_begin(Agent, "woundedClutch");
+                            nm_msg_set_bool(Agent, "start", 1);
+                            nm_msg_set_int(Agent, "woundPart", woundPart);
+                            nm_msg_set_bool(Agent, "onGround", 1);
+                            nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(hasTarget ? woundedCombat.CurrentAimTarget : Vector3.zero));
+                            nm_msg_set_float(Agent, "weakness", weakness);
+                            nm_msg_set_bool(Agent, "useLeftArm", 0);
+                            nm_msg_set_bool(Agent, "writhing", hasTarget ? 0 : 1);
+                            nm_msg_set_float(Agent, "groundZ", safeGroundY);
+                            nm_msg_send(Agent, WorldEntry.World);
+                        }
+                        else
+                        {
+                            nm_msg_begin(Agent, "woundedClutch");
+                            nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(hasTarget ? woundedCombat.CurrentAimTarget : Vector3.zero));
+                            nm_msg_set_float(Agent, "weakness", weakness);
+                            nm_msg_set_bool(Agent, "useLeftArm", 0);
+                            nm_msg_set_bool(Agent, "writhing", hasTarget ? 0 : 1);
+                            nm_msg_set_float(Agent, "groundZ", safeGroundY);
+                            nm_msg_send(Agent, WorldEntry.World);
+                        }
+
+                        bool finishedBursts = woundedCombat.CompletedBurstCount >= downedFightBackMaxBursts;
+                        bool lostTargetTimeout = !hasTarget && downedFightBackElapsed >= 1.35f;
+                        bool maxFightTime = downedFightBackElapsed >= 4.8f;
+                        if (finishedBursts || lostTargetTimeout || maxFightTime)
+                        {
+                            woundedCombat.StopPointArm(Agent, WorldEntry.World);
+                            StopActiveWoundedBehavior();
+                            activeFallenBehaviorActive = false;
+                            RequestGetUpFromFallen();
+                        }
+                        return;
+                    }
+                    else if (config.EnableDownedFightBack.Value)
+                    {
+                        // Roll failed: natural ground writhing & wound clutching for downedWritheDuration before getting up
+                        downedFightBackElapsed += dt;
+                        if (!activeFallenBehaviorActive)
+                        {
+                            nm_agent_task_stop(Agent);
+                            fallenTaskStopped = true;
+                            activeFallenBehaviorActive = true;
+                            activeWoundedBehavior = "woundedClutch";
+                            nm_msg_begin(Agent, "woundedClutch");
+                            nm_msg_set_bool(Agent, "start", 1);
+                            nm_msg_set_int(Agent, "woundPart", woundPart);
+                            nm_msg_set_bool(Agent, "onGround", 1);
+                            nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(Vector3.zero));
+                            nm_msg_set_float(Agent, "weakness", weakness);
+                            nm_msg_set_bool(Agent, "useLeftArm", (HealthState != null && HealthState.LeftArmRuined) ? 0 : 1);
+                            nm_msg_set_bool(Agent, "writhing", 1);
+                            nm_msg_set_float(Agent, "groundZ", safeGroundY);
+                            nm_msg_send(Agent, WorldEntry.World);
+                        }
+                        else
+                        {
+                            nm_msg_begin(Agent, "woundedClutch");
+                            nm_msg_set_vec3(Agent, "aimTarget", ToNmVec(Vector3.zero));
+                            nm_msg_set_float(Agent, "weakness", weakness);
+                            nm_msg_set_bool(Agent, "writhing", 1);
+                            nm_msg_set_float(Agent, "groundZ", safeGroundY);
+                            nm_msg_send(Agent, WorldEntry.World);
+                        }
+
+                        if (downedFightBackElapsed >= downedWritheDuration || fallenElapsed >= config.MaxFallenBeforeGetUp.Value + 1.5f)
+                        {
+                            StopActiveWoundedBehavior();
+                            activeFallenBehaviorActive = false;
+                            RequestGetUpFromFallen();
+                        }
+                        return;
+                    }
                 }
 
                 // After ~0.9s on the floor, stop lingering shot/writhe tasks so limbs settle cleanly for get-up
@@ -2211,20 +2473,86 @@ namespace DeliriumRavenfield.Core
                     fallenAnchorElapsed = 0f;
                 }
 
-                // Hand back to Ravenfield native GetUp animation once lying still or failsafe timer elapses
+                // Trigger pure-Delirium get-up (AI bots) or Ravenfield GetUp (player / when toggle off)
                 if (nm_agent_should_get_up(Agent, stillTarget) == 1 ||
                     fallenStillElapsed >= stillTarget ||
                     (fallenElapsed >= 1.1f && fallenAnchorElapsed >= stillTarget) ||
                     fallenElapsed >= config.MaxFallenBeforeGetUp.Value)
                 {
-                    HandBackToRavenfieldGetUp();
+                    RequestGetUpFromFallen();
+                }
+            }
+            else if (Phase == RagdollPhase.PhysicsGetUp)
+            {
+                if (nm_agent_is_dead(Agent) == 1)
+                    nm_agent_set_dead(Agent, 0);
+
+                physicsGetUpElapsed += dt;
+                Vector3 hipPos = hips != null ? hips.position : lastComPos;
+                float groundY = runtime.SampleGroundHeight(hipPos + Vector3.up * 0.4f, Actor.transform, hipPos.y - 2.5f);
+                float hipHeight = hipPos.y - groundY;
+                float headAboveHips = 0f;
+                var headPosArr = new float[3];
+                if (nm_agent_get_part_transform(Agent, 12, headPosArr, null) >= 0)
+                    headAboveHips = ToUnityVec(headPosArr).y - hipPos.y;
+                else
+                    headAboveHips = 0.50f * scale;
+
+                bool learnedRunning = nm_agent_learned_getup_running(Agent) == 1;
+                bool isHighEnough = hipHeight >= 0.76f * scale && headAboveHips >= 0.44f * scale;
+
+                if (isHighEnough && !physicsGetUpFallbackActive && (!learnedRunning || balancing))
+                {
+                    physicsGetUpStandingElapsed += dt;
+                    if (physicsGetUpStandingElapsed >= 0.18f || !learnedRunning)
+                    {
+                        CancelPhysicsGetUp(fallIfLow: false);
+                        BeginBlendBackToStanding(fromPhysicsGetUp: true);
+                        return;
+                    }
+                }
+                else
+                {
+                    physicsGetUpStandingElapsed = 0f;
+                }
+
+                if (!physicsGetUpFallbackActive)
+                {
+                    // If getup.net finished without reaching standing (e.g. tight corner / extreme skin) or timed out -> smooth Delirium upright assist!
+                    if ((!learnedRunning && physicsGetUpElapsed >= 0.35f) || physicsGetUpElapsed >= 3.2f)
+                    {
+                        nm_agent_learned_getup(Agent, null);
+                        physicsGetUpFallbackActive = true;
+                        physicsGetUpFallbackElapsed = 0f;
+                        Vector3 face = hips != null ? Vector3.ProjectOnPlane(hips.forward, Vector3.up) : Actor.transform.forward;
+                        if (face.sqrMagnitude < 1e-4f) face = Actor.transform.forward;
+                        nm_msg_begin(Agent, "physicsGetUp");
+                        nm_msg_set_bool(Agent, "start", 1);
+                        nm_msg_set_float(Agent, "groundZ", groundY);
+                        nm_msg_set_vec3(Agent, "facingDir", ToNmVec(face.normalized));
+                        nm_msg_send(Agent, WorldEntry.World);
+                        activeWoundedBehavior = "physicsGetUp";
+                    }
+                }
+                else
+                {
+                    physicsGetUpFallbackElapsed += dt;
+                    if ((isHighEnough && physicsGetUpFallbackElapsed >= 1.45f) || physicsGetUpFallbackElapsed >= 2.45f)
+                    {
+                        CancelPhysicsGetUp(fallIfLow: false);
+                        BeginBlendBackToStanding(fromPhysicsGetUp: true);
+                        return;
+                    }
                 }
             }
         }
 
         private void EnterActiveFallenState()
         {
-            if (!blindFireActive)
+            ResetDownedFightBackState();
+            EnsureDownedBehaviorRolled(isIncapacitated: false);
+            bool keepWeaponVisible = blindFireActive || downedFightBackActive;
+            if (!keepWeaponVisible)
                 RestoreWeaponParentTransform();
             ClearIncomingArmFollow();
             entryBlendDuration = 0f;
@@ -2246,8 +2574,12 @@ namespace DeliriumRavenfield.Core
                     Actor.animator.SetLayerWeight(RagdollAnimLayer, 1f);
                 }
                 try { Actor.controller?.StartRagdoll(); } catch { }
-                if (!blindFireActive && Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null)
+                if (!keepWeaponVisible && Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null)
                     Actor.activeWeapon.gameObject.SetActive(false);
+            }
+            if (downedFightBackActive)
+            {
+                EnsureWeaponVisibleInRagdollHand();
             }
         }
 
@@ -2318,18 +2650,53 @@ namespace DeliriumRavenfield.Core
                 {
                     Actor.hipRigidbody.transform.position = hipsWorldPos;
                 }
+                if (homerVisual.IsActive)
+                {
+                    homerVisual.SyncLateUpdate(Agent);
+                }
+                else if (Actor.skinnedRendererRagdoll != null && !Actor.skinnedRendererRagdoll.enabled)
+                {
+                    Actor.skinnedRendererRagdoll.enabled = true;
+                }
             }
 
-            // Keep bot's active weapon glued to the ragdoll hand while staggering, wounded-firing, or reflex blind-firing
+            // Subtle chest breathing expansion/contraction while downed & alive (fading out during DeathAgony)
+            UpdateAndApplyBreathing(Time.deltaTime);
+
+            // Keep bot's active weapon glued to the ragdoll hand ONLY when actively holding/firing,
+            // and hide it whenever fallen/writhing/dying without blind-fire so it NEVER floats on the hidden animatedObject!
             bool holdWeaponOnHand = Phase == RagdollPhase.ActiveStagger ||
                                     Phase == RagdollPhase.WoundedStanding ||
-                                    Phase == RagdollPhase.WoundedCrawling ||
+                                    (Phase == RagdollPhase.WoundedCrawling && downedFightBackActive) ||
+                                    (Phase == RagdollPhase.ActiveFallen && downedFightBackActive) ||
                                     blindFireActive;
-            if (holdWeaponOnHand && weaponAttachedToRagdoll &&
-                trackedWeaponParent != null && weaponRagdollHand != null)
+
+            if (!IsSyncLockstepControlled && Actor != null && !IsPlayer)
             {
-                trackedWeaponParent.position = weaponRagdollHand.TransformPoint(weaponHandOffsetPos);
-                trackedWeaponParent.rotation = weaponRagdollHand.rotation * weaponHandOffsetRot * (blindFireActive ? blindFireTwitchRot : Quaternion.identity);
+                if (holdWeaponOnHand)
+                {
+                    if (!weaponAttachedToRagdoll && !Actor.dead && Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null)
+                    {
+                        CaptureWeaponForRagdollHand(allowDeadWeapon: false);
+                    }
+                    if (weaponAttachedToRagdoll && trackedWeaponParent != null && weaponRagdollHand != null)
+                    {
+                        if (trackedWeaponParent.parent != weaponRagdollHand)
+                            trackedWeaponParent.SetParent(weaponRagdollHand, false);
+                        trackedWeaponParent.localPosition = weaponHandOffsetPos;
+                        trackedWeaponParent.localRotation = weaponHandOffsetRot * (blindFireActive ? blindFireTwitchRot : Quaternion.identity);
+                    }
+                }
+                else
+                {
+                    if (weaponAttachedToRagdoll)
+                        RestoreWeaponParentTransform();
+                    if (!Actor.dead && Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null && Actor.activeWeapon.gameObject.activeSelf)
+                    {
+                        Actor.activeWeapon.gameObject.SetActive(false);
+                        weaponHiddenByFallback = true;
+                    }
+                }
             }
         }
 
@@ -2349,7 +2716,7 @@ namespace DeliriumRavenfield.Core
             }
         }
 
-        private void BeginBlendBackToStanding()
+        private void BeginBlendBackToStanding(bool fromPhysicsGetUp = false)
         {
             if (Actor == null || Actor.ragdoll == null)
             {
@@ -2386,7 +2753,10 @@ namespace DeliriumRavenfield.Core
             }
 
             // Release Delirium native state and switch ActiveRaggy back to animated
+            homerVisual.Dispose();
+            RestoreChestBaseScales();
             StopBlindFire(dropIfDead: false);
+            ResetDownedFightBackState();
             RestoreWeaponParentTransform();
             ReleaseNativeOnly();
             RestoreRagdollRigidbodies();
@@ -2400,12 +2770,19 @@ namespace DeliriumRavenfield.Core
             Actor.ragdoll.InstantAnimate();
             Actor.fallenOver = false;
             Actor.wantsToGetUp = false;
+            if (Actor.animator != null)
+            {
+                Actor.animator.SetBool(AnimParRagdolled, false);
+                Actor.animator.SetLayerWeight(RagdollAnimLayer, 0f);
+            }
+            try { Actor.controller?.EndRagdoll(); } catch { }
             if (Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null)
                 Actor.activeWeapon.gameObject.SetActive(true);
 
-            // Set up smooth post-animation blend over GetUpBlendSeconds
+            // Set up smooth post-animation blend over GetUpBlendSeconds (including root hips pos + world rot!)
             if (animHips != null && ragdollRotMap.Count > 0)
             {
+                animBlendHips = animHips;
                 animBlendBones = new Transform[ragdollRotMap.Count];
                 animBlendStartRot = new Quaternion[ragdollRotMap.Count];
                 int idx = 0;
@@ -2418,11 +2795,14 @@ namespace DeliriumRavenfield.Core
                 animBlendStartHipPos = hipPos;
                 animBlendStartHipRot = startHipRot;
                 blendTimer = 0f;
-                blendDuration = Mathf.Max(config.GetUpBlendSeconds.Value, 0.05f);
+                blendDuration = fromPhysicsGetUp
+                    ? Mathf.Max(config.GetUpBlendSeconds.Value, 0.28f)
+                    : Mathf.Max(config.GetUpBlendSeconds.Value, 0.05f);
                 Phase = RagdollPhase.BlendingToStand;
             }
             else
             {
+                animBlendHips = null;
                 Phase = RagdollPhase.Animated;
             }
         }
@@ -2431,16 +2811,22 @@ namespace DeliriumRavenfield.Core
         {
             if (animBlendBones == null || Actor == null || Actor.dead)
             {
+                animBlendHips = null;
                 animBlendBones = null;
                 Phase = RagdollPhase.Animated;
                 return;
             }
 
             float k = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(blendTimer / blendDuration));
+            if (animBlendHips != null)
+            {
+                animBlendHips.position = Vector3.Lerp(animBlendStartHipPos, animBlendHips.position, k);
+                animBlendHips.rotation = Quaternion.Slerp(animBlendStartHipRot, animBlendHips.rotation, k);
+            }
             for (int i = 0; i < animBlendBones.Length; i++)
             {
                 var b = animBlendBones[i];
-                if (b == null) continue;
+                if (b == null || b == animBlendHips) continue;
                 b.localRotation = Quaternion.Slerp(animBlendStartRot[i], b.localRotation, k);
             }
         }
@@ -2470,6 +2856,15 @@ namespace DeliriumRavenfield.Core
             float groundY = runtime.SampleGroundHeight(hipPos + Vector3.up * 0.35f, Actor.transform, Actor.transform.position.y);
 
             // Release Delirium FIRST and restore non-kinematic rigidbodies with zero velocity
+            homerVisual.Dispose();
+            RestoreChestBaseScales();
+            if (activeFallenBehaviorActive)
+            {
+                woundedCombat.StopPointArm(Agent, WorldEntry != null ? WorldEntry.World : IntPtr.Zero);
+                StopActiveWoundedBehavior();
+                activeFallenBehaviorActive = false;
+            }
+            ResetDownedFightBackState();
             StopBlindFire(dropIfDead: false);
             RestoreWeaponParentTransform();
             ReleaseNativeOnly();
@@ -2489,6 +2884,8 @@ namespace DeliriumRavenfield.Core
             // Invoke Ravenfield's native GetUp FIRST (before enabling standing hitboxes), then immediately enforce
             // exact groundY + facing so Actor.GetUp()'s short 1m raycast & SyncAnimatorPosition never leave the bot floating!
             ActorGetUpMethod?.Invoke(Actor, null);
+            if (!Actor.dead && Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null && !Actor.activeWeapon.gameObject.activeSelf)
+                Actor.activeWeapon.gameObject.SetActive(true);
 
             Transform ragObjTf = Actor.ragdoll.ragdollObject != null ? Actor.ragdoll.ragdollObject.transform : null;
             Transform origParent = ragObjTf != null ? ragObjTf.parent : null;
@@ -2510,6 +2907,7 @@ namespace DeliriumRavenfield.Core
         public void FreezeDeadCorpse()
         {
             if (Phase == RagdollPhase.DeadFrozen) return;
+            RestoreChestBaseScales();
             StopBlindFire(dropIfDead: true);
             // Keep ragdollObject & ragdollColliders enabled in their final Delirium pose so bullets/explosions/cars
             // can still hit and wake this corpse back into active simulation, while freeing native Rust memory!
@@ -2521,7 +2919,11 @@ namespace DeliriumRavenfield.Core
 
         public void ReleaseImmediate(bool restoreGame)
         {
+            homerVisual.Dispose();
+            CancelPhysicsGetUp(fallIfLow: false);
+            RestoreChestBaseScales();
             ClearPartialKeyframe();
+            ResetDownedFightBackState();
             StopBlindFire(dropIfDead: Actor != null && Actor.dead);
             woundedCombat.StopPointArm(Agent, WorldEntry != null ? WorldEntry.World : IntPtr.Zero);
             woundedCombat.RestoreActorFlags(HealthState);
@@ -2539,6 +2941,12 @@ namespace DeliriumRavenfield.Core
                 if (!Actor.fallenOver)
                 {
                     Actor.ragdoll.InstantAnimate();
+                    if (Actor.animator != null)
+                    {
+                        Actor.animator.SetBool(AnimParRagdolled, false);
+                        Actor.animator.SetLayerWeight(RagdollAnimLayer, 0f);
+                    }
+                    try { Actor.controller?.EndRagdoll(); } catch { }
                 }
             }
 
@@ -2651,11 +3059,42 @@ namespace DeliriumRavenfield.Core
             }
 
             trackedWeaponParent = wp;
+            weaponParentSavedParent = wp.parent;
             weaponRagdollHand = ragBone;
             weaponParentSavedLocalPos = wp.localPosition;
             weaponParentSavedLocalRot = wp.localRotation;
-            weaponHandOffsetPos = animBone.InverseTransformPoint(wp.position);
-            weaponHandOffsetRot = Quaternion.Inverse(animBone.rotation) * wp.rotation;
+            weaponParentSavedLocalScale = wp.localScale;
+
+            bool wpIsChildOfAnim = wp.IsChildOf(animBone);
+            Vector3 liveOffsetPos = animBone.InverseTransformPoint(wp.position);
+            Quaternion liveOffsetRot = Quaternion.Inverse(animBone.rotation) * wp.rotation;
+
+            // Capture clean standing grip offset once when animatedObject is still aligned; reuse on subsequent ground re-attaches!
+            if (!hasCachedWeaponGripOffset && wpIsChildOfAnim && liveOffsetPos.magnitude < 0.25f)
+            {
+                cachedWeaponGripPos = liveOffsetPos;
+                cachedWeaponGripRot = liveOffsetRot;
+                hasCachedWeaponGripOffset = true;
+            }
+
+            if (hasCachedWeaponGripOffset)
+            {
+                weaponHandOffsetPos = cachedWeaponGripPos;
+                weaponHandOffsetRot = cachedWeaponGripRot;
+            }
+            else
+            {
+                weaponHandOffsetPos = liveOffsetPos.magnitude < 0.25f
+                    ? liveOffsetPos
+                    : (liveOffsetPos.sqrMagnitude > 1e-6f ? liveOffsetPos.normalized * 0.08f : Vector3.zero);
+                weaponHandOffsetRot = liveOffsetRot;
+            }
+
+            // Reparent directly onto the ragdoll right hand so Unity's transform hierarchy locks the gun to the palm with zero lag or Animator fighting
+            trackedWeaponParent.SetParent(weaponRagdollHand, false);
+            trackedWeaponParent.localPosition = weaponHandOffsetPos;
+            trackedWeaponParent.localRotation = weaponHandOffsetRot;
+            trackedWeaponParent.localScale = weaponParentSavedLocalScale;
             weaponAttachedToRagdoll = true;
         }
 
@@ -2663,8 +3102,11 @@ namespace DeliriumRavenfield.Core
         {
             if (weaponAttachedToRagdoll && trackedWeaponParent != null)
             {
+                if (weaponParentSavedParent != null && trackedWeaponParent.parent != weaponParentSavedParent)
+                    trackedWeaponParent.SetParent(weaponParentSavedParent, false);
                 trackedWeaponParent.localPosition = weaponParentSavedLocalPos;
                 trackedWeaponParent.localRotation = weaponParentSavedLocalRot;
+                trackedWeaponParent.localScale = weaponParentSavedLocalScale;
             }
             if (weaponHiddenByFallback && Actor != null && !Actor.dead && !Actor.fallenOver &&
                 Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null)
@@ -2672,6 +3114,7 @@ namespace DeliriumRavenfield.Core
                 Actor.activeWeapon.gameObject.SetActive(true);
             }
             trackedWeaponParent = null;
+            weaponParentSavedParent = null;
             weaponRagdollHand = null;
             weaponAttachedToRagdoll = false;
             weaponHiddenByFallback = false;
@@ -3259,6 +3702,33 @@ namespace DeliriumRavenfield.Core
             }
         }
 
+        private void EnsureRagdollRenderersNeverCull()
+        {
+            if (Actor == null) return;
+            if (Actor.skinnedRendererRagdoll != null)
+            {
+                Actor.skinnedRendererRagdoll.enabled = true;
+                Actor.skinnedRendererRagdoll.updateWhenOffscreen = true;
+                Actor.skinnedRendererRagdoll.allowOcclusionWhenDynamic = false;
+            }
+            if (Actor.ragdoll?.ragdollObject != null)
+            {
+                var smrs = Actor.ragdoll.ragdollObject.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+                for (int i = 0; i < smrs.Length; i++)
+                {
+                    if (smrs[i] == null) continue;
+                    smrs[i].updateWhenOffscreen = true;
+                    smrs[i].allowOcclusionWhenDynamic = false;
+                }
+                var mrs = Actor.ragdoll.ragdollObject.GetComponentsInChildren<MeshRenderer>(true);
+                for (int i = 0; i < mrs.Length; i++)
+                {
+                    if (mrs[i] == null) continue;
+                    mrs[i].allowOcclusionWhenDynamic = false;
+                }
+            }
+        }
+
         private void ReanchorWorldIfNeeded()
         {
             if (WorldEntry == null || Actor == null || !IsSimulating) return;
@@ -3310,6 +3780,7 @@ namespace DeliriumRavenfield.Core
         {
             if (!config.EnableBlindFire.Value || IsPlayer || Actor == null) return;
             if (blindFireActive) return;
+            if (!isDeathShot && blindFireTriggeredThisStagger) return;
 
             Weapon w = null;
             if (blindFirePendingStart && blindFireWeapon != null)
@@ -3333,21 +3804,20 @@ namespace DeliriumRavenfield.Core
 
             blindFireWeapon = w;
             blindFireActive = true;
+            blindFireTriggeredThisStagger = true;
+            blindFireForcesFall = Phase == RagdollPhase.ActiveStagger || Phase == RagdollPhase.DyingStagger;
             blindFireElapsed = 0f;
             blindFireShotsFired = 0;
 
             bool isAuto = w.configuration.auto;
+            int minShots = Mathf.Clamp(config.BlindFireMinShots.Value, 1, 6);
+            int maxShots = Mathf.Clamp(config.BlindFireMaxShots.Value, minShots, 8);
+            blindFireMaxShots = Mathf.Min(UnityEngine.Random.Range(minShots, maxShots + 1), Mathf.Max(1, w.ammo));
+
+            float cd = w.configuration != null ? Mathf.Max(w.configuration.cooldown, 0.08f) : 0.12f;
+            float neededSec = blindFireMaxShots * cd * 1.45f + 0.18f;
             float maxSec = Mathf.Clamp(config.BlindFireMaxSeconds.Value, 0.15f, 1.5f);
-            if (isAuto)
-            {
-                blindFireDuration = UnityEngine.Random.Range(Mathf.Min(0.22f, maxSec), maxSec);
-                blindFireMaxShots = UnityEngine.Random.Range(2, 7);
-            }
-            else
-            {
-                blindFireDuration = Mathf.Min(0.28f, maxSec);
-                blindFireMaxShots = 1;
-            }
+            blindFireDuration = Mathf.Max(maxSec, Mathf.Min(neededSec, 1.45f));
 
             // Immediate startled reflex trigger pull (0.02..0.09s after impact)
             blindFireNextShotTime = UnityEngine.Random.Range(0.02f, 0.09f);
@@ -3355,8 +3825,8 @@ namespace DeliriumRavenfield.Core
             // Sudden startled wrist/gun jerk biased upward & sideways so barrel whips off-target immediately
             float spread = Mathf.Clamp(config.BlindFireWildSpreadDegrees.Value, 10f, 80f);
             blindFireTwitchRot = Quaternion.Euler(
-                UnityEngine.Random.Range(-spread * 0.85f, -spread * 0.20f),
-                UnityEngine.Random.Range(-spread * 0.90f, spread * 0.90f),
+                UnityEngine.Random.Range(-spread * 0.85f, -spread * 0.25f),
+                UnityEngine.Random.Range(-spread * 0.95f, spread * 0.95f),
                 UnityEngine.Random.Range(-25f, 25f));
 
             // Glue weapon to ragdoll hand so the player visually sees the flailing gun discharge!
@@ -3368,7 +3838,7 @@ namespace DeliriumRavenfield.Core
                 w.gameObject.SetActive(true);
 
             if (config.DebugLog.Value)
-                Plugin.Log.LogInfo($"[Delirium] Reflex blind-fire triggered on {Actor.name} (auto={isAuto}, maxShots={blindFireMaxShots}, dur={blindFireDuration:F2}s)");
+                Plugin.Log.LogInfo($"[Delirium] Reflex blind-fire triggered on {Actor.name} (auto={isAuto}, maxShots={blindFireMaxShots}, dur={blindFireDuration:F2}s, forceFall={blindFireForcesFall})");
         }
 
         private void TickBlindFire(float dt)
@@ -3486,6 +3956,31 @@ namespace DeliriumRavenfield.Core
             float pitch = UnityEngine.Random.Range(-spread * 0.95f, spread * 0.55f);
             Vector3 wild = (Quaternion.Euler(pitch, yaw, 0f) * baseDir).normalized;
 
+            // Never aim startled blind-fire directly at the player (or attacker): deflect outward/upward if within a 28-deg cone!
+            Actor avoid = null;
+            if (ActorManager.instance != null && ActorManager.instance.player != null && !ActorManager.instance.player.dead)
+                avoid = ActorManager.instance.player;
+            else if (HealthState != null && HealthState.LastAttacker != null && !HealthState.LastAttacker.dead)
+                avoid = HealthState.LastAttacker;
+
+            if (avoid != null)
+            {
+                Vector3 toAvoid = avoid.CenterPosition() - muzzlePos;
+                if (toAvoid.sqrMagnitude > 0.04f)
+                {
+                    toAvoid.Normalize();
+                    if (Vector3.Angle(wild, toAvoid) < 28f)
+                    {
+                        Vector3 side = Vector3.Cross(Vector3.up, toAvoid);
+                        if (side.sqrMagnitude < 1e-4f) side = Vector3.right;
+                        side.Normalize();
+                        float sideSign = (UnityEngine.Random.value < 0.5f) ? -1f : 1f;
+                        Vector3 safeTarget = (toAvoid + side * (sideSign * UnityEngine.Random.Range(0.75f, 1.35f)) + Vector3.up * UnityEngine.Random.Range(0.25f, 0.75f)).normalized;
+                        wild = safeTarget;
+                    }
+                }
+            }
+
             // Avoid muzzle somehow pointing straight back into the bot's own torso
             Vector3 awayFromBody = muzzlePos - lastComPos;
             if (awayFromBody.sqrMagnitude > 0.02f && Vector3.Dot(wild, awayFromBody.normalized) < -0.15f)
@@ -3499,9 +3994,11 @@ namespace DeliriumRavenfield.Core
         {
             Weapon w = blindFireWeapon;
             int deferredSlot = blindFireDeferredSlot;
+            bool forceFall = blindFireForcesFall;
 
             blindFireActive = false;
             blindFirePendingStart = false;
+            blindFireForcesFall = false;
             blindFireWeapon = null;
             blindFireDeferredSlot = -1;
             blindFireTwitchRot = Quaternion.identity;
@@ -3509,6 +4006,28 @@ namespace DeliriumRavenfield.Core
             if (w != null)
             {
                 try { w.StopFire(); } catch { }
+            }
+
+            // After finishing the 2-4 startled shots while staggering, stop firing and drop naturally onto the floor!
+            if (forceFall && Agent != IntPtr.Zero && WorldEntry != null)
+            {
+                if (Phase == RagdollPhase.ActiveStagger && Actor != null && !Actor.dead)
+                {
+                    nm_msg_send_text(Agent, WorldEntry.World, "stayUpright start=false");
+                    nm_msg_send_text(Agent, WorldEntry.World, "shotRelax relaxPeriod=0.35");
+                    nm_msg_send_text(Agent, WorldEntry.World, "catchFall start=true armsStiffness=6.8 torsoStiffness=5.8 legsStiffness=3.4");
+                    Vector3 fallDir = Vector3.ProjectOnPlane(aliveStaggerDir.sqrMagnitude > 1e-4f ? aliveStaggerDir : -Actor.transform.forward, Vector3.up);
+                    if (fallDir.sqrMagnitude < 1e-4f) fallDir = -Actor.transform.forward;
+                    Vector3 at = hips != null ? hips.position + Vector3.up * 0.25f : lastComPos;
+                    ApplyNaturalDistributedImpulse(10, at, fallDir.normalized, 22f, out _, out _);
+                }
+                else if (Phase == RagdollPhase.DyingStagger && !dyingRelaxTriggered)
+                {
+                    dyingRelaxTriggered = true;
+                    nm_msg_send_text(Agent, WorldEntry.World, "stayUpright start=false");
+                    nm_msg_send_text(Agent, WorldEntry.World, "shotRelax relaxPeriod=0.40");
+                    dyingStaggerDuration = Mathf.Min(dyingStaggerDuration, dyingStaggerElapsed + 0.45f);
+                }
             }
 
             if (dropIfDead && deferredSlot >= 0)
@@ -3534,13 +4053,252 @@ namespace DeliriumRavenfield.Core
                     try { w.Drop(); } catch { }
                 }
             }
-            else if (Actor != null && !Actor.dead && Actor.fallenOver && Phase == RagdollPhase.ActiveFallen)
+            else if (Actor != null && !Actor.dead && Actor.fallenOver && Phase == RagdollPhase.ActiveFallen && !downedFightBackActive)
             {
-                // Alive bot finished blind-firing mid-fall: hide weapon cleanly until get-up
+                // Alive bot finished blind-firing mid-fall without downed fight-back: hide weapon cleanly until get-up
                 RestoreWeaponParentTransform();
                 if (Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null)
                     Actor.activeWeapon.gameObject.SetActive(false);
             }
+        }
+
+        private static string ResolveGetUpNetPath()
+        {
+            if (getUpNetPathChecked) return resolvedGetUpNetPath;
+            getUpNetPathChecked = true;
+            try
+            {
+                string asmDir = System.IO.Path.GetDirectoryName(typeof(ActorRagdollController).Assembly.Location);
+                if (!string.IsNullOrEmpty(asmDir))
+                {
+                    string cand = System.IO.Path.Combine(asmDir, "getup.net");
+                    if (System.IO.File.Exists(cand))
+                    {
+                        resolvedGetUpNetPath = cand;
+                        return resolvedGetUpNetPath;
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private void RequestGetUpFromFallen()
+        {
+            if (!IsPlayer && config.EnablePureDeliriumGetUp.Value && Agent != IntPtr.Zero && WorldEntry != null)
+            {
+                StartPureDeliriumGetUp();
+            }
+            else
+            {
+                HandBackToRavenfieldGetUp();
+            }
+        }
+
+        private void StartPureDeliriumGetUp()
+        {
+            if (Actor == null || Actor.dead || Agent == IntPtr.Zero || WorldEntry == null)
+            {
+                HandBackToRavenfieldGetUp();
+                return;
+            }
+
+            woundedCombat.StopPointArm(Agent, WorldEntry.World);
+            StopActiveWoundedBehavior();
+            StopBlindFire(dropIfDead: false);
+            RestoreWeaponParentTransform();
+            ResetDownedFightBackState();
+
+            // Keep weapon hidden while both hands push off the floor; BeginBlendBackToStanding re-enables it cleanly!
+            if (Actor.HasUnholsteredWeapon() && Actor.activeWeapon != null && Actor.activeWeapon.gameObject.activeSelf)
+            {
+                Actor.activeWeapon.gameObject.SetActive(false);
+                weaponHiddenByFallback = true;
+            }
+
+            nm_agent_task_stop(Agent);
+            nm_msg_send_text(Agent, WorldEntry.World, "stopAllBehaviours");
+            nm_agent_set_dead(Agent, 0);
+
+            physicsGetUpElapsed = 0f;
+            physicsGetUpStandingElapsed = 0f;
+            physicsGetUpFallbackActive = false;
+            physicsGetUpFallbackElapsed = 0f;
+
+            // Use our upgraded 2-stage Delirium physicsGetUp (rolls supine->prone, pushes off floor with both hands,
+            // rises into bodyBalance) — 100% reliable on every map elevation and Workshop skin, zero Ravenfield Actor.GetUp!
+            Vector3 hipPos = hips != null ? hips.position : lastComPos;
+            float groundY = runtime.SampleGroundHeight(hipPos + Vector3.up * 0.4f, Actor.transform, hipPos.y - 2.5f);
+            Vector3 face = hips != null ? Vector3.ProjectOnPlane(hips.forward, Vector3.up) : Actor.transform.forward;
+            if (face.sqrMagnitude < 1e-4f) face = Actor.transform.forward;
+            nm_msg_begin(Agent, "physicsGetUp");
+            nm_msg_set_bool(Agent, "start", 1);
+            nm_msg_set_float(Agent, "groundZ", groundY);
+            nm_msg_set_vec3(Agent, "facingDir", ToNmVec(face.normalized));
+            nm_msg_send(Agent, WorldEntry.World);
+            activeWoundedBehavior = "physicsGetUp";
+            physicsGetUpFallbackActive = true;
+            Phase = RagdollPhase.PhysicsGetUp;
+            if (config.DebugLog.Value)
+                Plugin.Log.LogInfo($"[Delirium] Started 2-stage pure-Delirium physicsGetUp for {Actor.name}");
+        }
+
+        private void CancelPhysicsGetUp(bool fallIfLow)
+        {
+            if (Agent != IntPtr.Zero && nm_agent_learned_getup_running(Agent) == 1)
+            {
+                nm_agent_learned_getup(Agent, null);
+            }
+            if (activeWoundedBehavior == "physicsGetUp")
+            {
+                StopActiveWoundedBehavior();
+            }
+            physicsGetUpFallbackActive = false;
+            physicsGetUpElapsed = 0f;
+            physicsGetUpStandingElapsed = 0f;
+            physicsGetUpFallbackElapsed = 0f;
+
+            if (fallIfLow && Phase == RagdollPhase.PhysicsGetUp && Actor != null && !Actor.dead)
+            {
+                Vector3 hipPos = hips != null ? hips.position : lastComPos;
+                float groundY = runtime.SampleGroundHeight(hipPos + Vector3.up * 0.4f, Actor.transform, hipPos.y - 2.5f);
+                bool stillLow = (hipPos.y - groundY) < 0.58f * scale;
+                Phase = stillLow ? RagdollPhase.ActiveFallen : RagdollPhase.ActiveStagger;
+            }
+        }
+
+        private void ResetDownedFightBackState()
+        {
+            downedFightBackRolled = false;
+            downedFightBackActive = false;
+            downedFightBackElapsed = 0f;
+            downedFightBackMaxBursts = 1;
+            downedWritheDuration = 2.0f;
+            activeFallenBehaviorActive = false;
+            woundedCombat.Reset();
+        }
+
+        private void EnsureDownedBehaviorRolled(bool isIncapacitated)
+        {
+            if (downedFightBackRolled) return;
+            downedFightBackRolled = true;
+            downedFightBackElapsed = 0f;
+            downedWritheDuration = UnityEngine.Random.Range(1.8f, 2.8f);
+            downedFightBackMaxBursts = isIncapacitated ? 999 : UnityEngine.Random.Range(1, 3);
+
+            bool rightArmRuined = HealthState != null && HealthState.RightArmRuined;
+            bool eligible = config.EnableDownedFightBack.Value &&
+                            !IsPlayer &&
+                            Actor != null && !Actor.dead &&
+                            !rightArmRuined &&
+                            woundedCombat.HasUsableFirearm();
+
+            downedFightBackActive = eligible && (UnityEngine.Random.value <= config.DownedFightBackChance.Value);
+            if (config.DebugLog.Value)
+                Plugin.Log.LogInfo($"[Delirium] Downed roll on {Actor?.name}: fightBack={downedFightBackActive} (incap={isIncapacitated}, maxBursts={downedFightBackMaxBursts})");
+        }
+
+        private void CacheChestBonesForBreathing(int[] parts)
+        {
+            RestoreChestBaseScales();
+            chestBoneIndices = null;
+            chestBaseLocalScales = null;
+            breathingPhase = UnityEngine.Random.Range(0f, Mathf.PI * 2f);
+            breathingWeight = 0f;
+
+            if (bones == null || parts == null) return;
+            var idxList = new List<int>(2);
+            var scaleList = new List<Vector3>(2);
+            int n = Mathf.Min(bones.Length, parts.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (bones[i] == null) continue;
+                // NM parts 9 (Spine2 / Chest) and 10 (Spine3 / UpperChest)
+                if (parts[i] == 9 || parts[i] == 10)
+                {
+                    idxList.Add(i);
+                    scaleList.Add(bones[i].localScale);
+                }
+            }
+            if (idxList.Count > 0)
+            {
+                chestBoneIndices = idxList.ToArray();
+                chestBaseLocalScales = scaleList.ToArray();
+            }
+        }
+
+        private void UpdateAndApplyBreathing(float dt)
+        {
+            if (chestBoneIndices == null || chestBaseLocalScales == null || bones == null) return;
+
+            float targetWeight = 0f;
+            float rateHz = 0.36f;
+
+            if (config.EnableDownedBreathing.Value && !IsSyncLockstepControlled)
+            {
+                bool isAliveGrounded = Actor != null && !Actor.dead &&
+                    (Phase == RagdollPhase.ActiveFallen ||
+                     Phase == RagdollPhase.WoundedCrawling ||
+                     (Phase == RagdollPhase.Surrendering && HealthState != null && HealthState.Condition == WoundedCondition.SurrenderingGround));
+
+                if (isAliveGrounded)
+                {
+                    targetWeight = 1f;
+                    float weakness = HealthState != null ? HealthState.Weakness01 : 0.1f;
+                    bool bleeding = HealthState != null && HealthState.IsBleeding;
+                    // Faster, slightly more labored breathing when bleeding or losing blood
+                    rateHz = Mathf.Lerp(bleeding ? 0.50f : 0.36f, 0.72f, weakness);
+                }
+                else if (Phase == RagdollPhase.DeadSimulating && deathAgonyActive && deathAgonyDuration > 0.1f)
+                {
+                    // Gradually fade breathing out during final-breath DeathAgony until completely still
+                    float rem01 = Mathf.Clamp01(1f - deathAgonyElapsed / deathAgonyDuration);
+                    targetWeight = rem01 * 0.85f;
+                    rateHz = Mathf.Lerp(0.18f, 0.42f, rem01);
+                }
+            }
+
+            breathingWeight = Mathf.MoveTowards(breathingWeight, targetWeight, dt * 1.8f);
+            if (breathingWeight <= 0.001f)
+            {
+                RestoreChestBaseScales();
+                return;
+            }
+
+            breathingPhase += dt * rateHz * Mathf.PI * 2f;
+            if (breathingPhase > Mathf.PI * 200f) breathingPhase -= Mathf.PI * 200f;
+
+            // Organic asymmetric breath curve (slightly sharper inhale, relaxed exhale)
+            float wave = 0.5f - 0.5f * Mathf.Cos(breathingPhase);
+            wave = Mathf.Pow(wave, 1.35f);
+
+            float weaknessBoost = (HealthState != null && HealthState.IsBleeding) ? 1.20f : 1.0f;
+            float amp = 0.028f * Mathf.Clamp(config.DownedBreathingIntensity.Value, 0.2f, 2.5f) * weaknessBoost * breathingWeight * wave;
+
+            for (int i = 0; i < chestBoneIndices.Length; i++)
+            {
+                int bi = chestBoneIndices[i];
+                if (bi < 0 || bi >= bones.Length || bones[bi] == null) continue;
+                Vector3 baseS = chestBaseLocalScales[i];
+                bones[bi].localScale = new Vector3(
+                    baseS.x * (1f + amp),
+                    baseS.y * (1f + amp * 0.35f),
+                    baseS.z * (1f + amp));
+            }
+        }
+
+        private void RestoreChestBaseScales()
+        {
+            if (chestBoneIndices == null || chestBaseLocalScales == null || bones == null) return;
+            for (int i = 0; i < chestBoneIndices.Length; i++)
+            {
+                int bi = chestBoneIndices[i];
+                if (bi >= 0 && bi < bones.Length && bones[bi] != null)
+                {
+                    bones[bi].localScale = chestBaseLocalScales[i];
+                }
+            }
+            breathingWeight = 0f;
         }
 
         private void ReleaseNativeOnly()

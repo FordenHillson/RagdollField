@@ -41,8 +41,14 @@ namespace DeliriumRavenfield.Config
         public ConfigEntry<bool> EnableDyingBleed { get; }
         public ConfigEntry<bool> EnableBlindFire { get; }
         public ConfigEntry<float> BlindFireChance { get; }
+        public ConfigEntry<int> BlindFireMinShots { get; }
+        public ConfigEntry<int> BlindFireMaxShots { get; }
         public ConfigEntry<float> BlindFireMaxSeconds { get; }
         public ConfigEntry<float> BlindFireWildSpreadDegrees { get; }
+        public ConfigEntry<bool> EnableDownedFightBack { get; }
+        public ConfigEntry<float> DownedFightBackChance { get; }
+        public ConfigEntry<bool> EnableDownedBreathing { get; }
+        public ConfigEntry<float> DownedBreathingIntensity { get; }
         public ConfigEntry<bool> EnableDeathAgony { get; }
         public ConfigEntry<float> DeathAgonyChance { get; }
         public ConfigEntry<float> DeathAgonyMinSeconds { get; }
@@ -58,6 +64,8 @@ namespace DeliriumRavenfield.Config
         public ConfigEntry<float> EntryBlendSeconds { get; }
         public ConfigEntry<float> GetUpBlendSeconds { get; }
         public ConfigEntry<float> MaxStaggerTimeBeforeForceRecover { get; }
+        public ConfigEntry<bool> EnablePureDeliriumGetUp { get; }
+        public ConfigEntry<bool> UsePlayroomHomerModel { get; }
 
         // [Environment]
         public ConfigEntry<bool> EnableVehicles { get; }
@@ -185,12 +193,28 @@ namespace DeliriumRavenfield.Config
             BlindFireChance = cfg.Bind("Reactions", "BlindFireChance", 0.45f,
                 new ConfigDescription("Probability (0-1) that a shot bot carrying a loaded gun accidentally pulls the trigger while staggering or collapsing.",
                     new AcceptableValueRange<float>(0f, 1f)));
-            BlindFireMaxSeconds = cfg.Bind("Reactions", "BlindFireMaxSeconds", 0.65f,
-                new ConfigDescription("Maximum duration (s) of an accidental reflex burst on full-auto weapons (semi-auto/shotguns fire 1 sudden round).",
+            BlindFireMinShots = cfg.Bind("Reactions", "BlindFireMinShots", 2,
+                new ConfigDescription("Minimum number of wild startled shots fired before stopping and falling.",
+                    new AcceptableValueRange<int>(1, 6)));
+            BlindFireMaxShots = cfg.Bind("Reactions", "BlindFireMaxShots", 4,
+                new ConfigDescription("Maximum number of wild startled shots fired before stopping and falling.",
+                    new AcceptableValueRange<int>(1, 8)));
+            BlindFireMaxSeconds = cfg.Bind("Reactions", "BlindFireMaxSeconds", 0.75f,
+                new ConfigDescription("Base maximum duration (s) of an accidental reflex burst.",
                     new AcceptableValueRange<float>(0.15f, 1.5f)));
             BlindFireWildSpreadDegrees = cfg.Bind("Reactions", "BlindFireWildSpreadDegrees", 38f,
                 new ConfigDescription("Extra wild angular deflection (degrees) added on top of the flailing ragdoll muzzle direction during accidental discharge.",
                     new AcceptableValueRange<float>(10f, 80f)));
+            EnableDownedFightBack = cfg.Bind("Reactions", "EnableDownedFightBack", true,
+                "Downed alive bots have a random chance to prop up (supine sit-up or prone push-up) and aim/shoot at the player; otherwise they writhe and clutch wounds naturally.");
+            DownedFightBackChance = cfg.Bind("Reactions", "DownedFightBackChance", 0.50f,
+                new ConfigDescription("Probability (0-1) that a downed alive bot tries to prop up and shoot back instead of writhing/clutching wounds.",
+                    new AcceptableValueRange<float>(0f, 1f)));
+            EnableDownedBreathing = cfg.Bind("Reactions", "EnableDownedBreathing", true,
+                "Subtle chest expansion/contraction breathing animation while downed and alive (fades out during DeathAgony).");
+            DownedBreathingIntensity = cfg.Bind("Reactions", "DownedBreathingIntensity", 1.0f,
+                new ConfigDescription("Amplitude multiplier for subtle downed chest breathing (1.0 = subtle ~2.8% chest heave).",
+                    new AcceptableValueRange<float>(0.2f, 2.5f)));
             EnableDeathAgony = cfg.Bind("Reactions", "EnableDeathAgony", true,
                 "Non-headshot fatal hits trigger subtle dying movement (writhing, curling, weak reaching) before going fully limp.");
             DeathAgonyChance = cfg.Bind("Reactions", "DeathAgonyChance", 0.75f,
@@ -229,6 +253,10 @@ namespace DeliriumRavenfield.Config
             MaxStaggerTimeBeforeForceRecover = cfg.Bind("StaggerAndGetUp", "MaxStaggerTimeBeforeForceRecover", 3.5f,
                 new ConfigDescription("Failsafe max seconds in alive standing stagger before forcing recovery back to combat.",
                     new AcceptableValueRange<float>(1.5f, 10.0f)));
+            EnablePureDeliriumGetUp = cfg.Bind("StaggerAndGetUp", "EnablePureDeliriumGetUp", false,
+                "Experimental: use Delirium's procedural physics get-up instead of Ravenfield's hand-animated push-off-floor Actor.GetUp animation (off by default for natural hands-on-floor get-up).");
+            UsePlayroomHomerModel = cfg.Bind("Skeleton", "UsePlayroomHomerModel", true,
+                "Replace AI bots' ragdoll physics rig and visual mesh with Playroom's exact 21-part Homer model + rig (homer-own.json) while Delirium simulates them.");
 
             EnableVehicles = cfg.Bind("Environment", "EnableVehicles", true,
                 "Sync moving Ravenfield vehicles to Delirium for pre-impact bracing and realistic vehicle hits.");
@@ -346,8 +374,14 @@ namespace DeliriumRavenfield.Config
             EnableDyingBleed.Value = true;
             EnableBlindFire.Value = true;
             BlindFireChance.Value = 0.45f;
-            BlindFireMaxSeconds.Value = 0.65f;
+            BlindFireMinShots.Value = 2;
+            BlindFireMaxShots.Value = 4;
+            BlindFireMaxSeconds.Value = 0.75f;
             BlindFireWildSpreadDegrees.Value = 38f;
+            EnableDownedFightBack.Value = true;
+            DownedFightBackChance.Value = 0.50f;
+            EnableDownedBreathing.Value = true;
+            DownedBreathingIntensity.Value = 1.0f;
             EnableEnginePhysicsColliders.Value = true;
             EnableCorpseShootAndWake.Value = true;
             EnableDeathAgony.Value = true;
@@ -360,6 +394,7 @@ namespace DeliriumRavenfield.Config
             LyingStillBeforeGetUp.Value = 0.8f;
             MaxFallenBeforeGetUp.Value = 3.0f;
             EntryBlendSeconds.Value = 0.16f;
+            EnablePureDeliriumGetUp.Value = true;
 
             EnableLocationalHealth.Value = true;
             LegHpRatio.Value = 0.45f;
