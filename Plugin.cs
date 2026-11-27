@@ -18,7 +18,7 @@ namespace DeliriumRavenfield
     {
         public const string PluginGuid = "com.fordg.deliriumravenfield";
         public const string PluginName = "Delirium Ravenfield";
-        public const string PluginVersion = "1.1.0";
+        public const string PluginVersion = "1.2.0";
 
         public static ManualLogSource Log { get; private set; }
         public static ModConfig ConfigInstance { get; private set; }
