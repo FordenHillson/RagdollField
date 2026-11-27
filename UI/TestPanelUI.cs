@@ -285,7 +285,6 @@ namespace DeliriumRavenfield.UI
             config.EnableDownedFightBack.Value = GUILayout.Toggle(config.EnableDownedFightBack.Value, "Downed Shoot");
             config.EnableDownedBreathing.Value = GUILayout.Toggle(config.EnableDownedBreathing.Value, "Breathing");
             config.EnablePureDeliriumGetUp.Value = GUILayout.Toggle(config.EnablePureDeliriumGetUp.Value, "Delirium GetUp");
-            config.UsePlayroomHomerModel.Value = GUILayout.Toggle(config.UsePlayroomHomerModel.Value, "Homer Model");
             GUILayout.EndHorizontal();
 
             // Aimed target diagnostics & Locational Wound Test Buttons

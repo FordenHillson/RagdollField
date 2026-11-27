@@ -43,11 +43,13 @@ namespace DeliriumRavenfield.Patches
                 };
                 damageInProgressActor = __instance;
 
-                if (__instance == null || __instance.dead || Plugin.LodManager == null || Plugin.ConfigInstance == null)
+                if (__instance == null || __instance.dead || __instance.isInvulnerable || Plugin.LodManager == null || Plugin.ConfigInstance == null)
                     return;
                 if (!Plugin.ConfigInstance.Enabled.Value || !Plugin.ConfigInstance.EnableLocationalHealth.Value)
                     return;
                 if (LodManager.IsAllowingBleedoutKill)
+                    return;
+                if (info.healthDamage <= 0.01f && info.balanceDamage <= 0.01f)
                     return;
 
                 // Only AI bots (not player, not seated in vehicles)
@@ -151,7 +153,10 @@ namespace DeliriumRavenfield.Patches
                     return;
                 }
 
-                // Locational health hit routing (fires even if clamped healthDamage was 0!)
+                // Locational health hit routing (only when Actor.Damage accepted the hit, even if clamped healthDamage was 0!)
+                if (!__result)
+                    return;
+
                 if (__state.UsedLocational && __state.HealthState != null)
                 {
                     // Restore raw damage on local copy for accurate impulse normalization
@@ -537,7 +542,7 @@ namespace DeliriumRavenfield.Patches
             }
         }
 
-        // 7. ActorManager.Explode -> unified Delirium blast wave for nearby actors
+        // 7. ActorManager.Explode -> wake nearby corpses & catch knocked-down actors (alive hits are already handled by Patch_Actor_Damage!)
         [HarmonyPatch(typeof(ActorManager), nameof(ActorManager.Explode), new[] { typeof(ExplosionInfo), typeof(bool) })]
         private static class Patch_ActorManager_Explode
         {
@@ -547,6 +552,10 @@ namespace DeliriumRavenfield.Patches
                 var am = ActorManager.instance;
                 if (am == null || info.configuration == null) return;
 
+                // Ignore zero-force/zero-damage explosions (smoke grenades, flashbangs, cosmetic blasts)
+                if (info.configuration.force <= 1f && info.configuration.damage <= 1f && info.configuration.balanceDamage <= 1f)
+                    return;
+
                 float radius = Mathf.Max(info.configuration.balanceRange, info.configuration.damageRange);
                 if (radius <= 0.5f) return;
 
@@ -554,10 +563,23 @@ namespace DeliriumRavenfield.Patches
                 if (nearby == null) return;
 
                 float rawForce = info.configuration.force;
+                Vector3 blastOrigin = info.point + Vector3.up * 0.25f;
+                const int worldMask = 1 << 0;
+
                 for (int i = 0; i < nearby.Count; i++)
                 {
                     var actor = nearby[i];
                     if (actor == null || actor.IsSeated()) continue;
+
+                    // Alive actors genuinely hit by the blast already received ApplyExplosion via Patch_Actor_Damage.
+                    // Never knock down unhit/behind-wall/friendly-fire-immune alive bots! Only catch corpses or already-fallen bots with clear LOS.
+                    if (!actor.dead && !actor.fallenOver) continue;
+                    if (actor.dead && !Plugin.ConfigInstance.EnableCorpseShootAndWake.Value) continue;
+
+                    Vector3 targetPos = actor.CenterPosition();
+                    if (Physics.Linecast(blastOrigin, targetPos, worldMask, QueryTriggerInteraction.Ignore))
+                        continue;
+
                     var ctrl = actor.dead
                         ? Plugin.LodManager.TryAcquireOrWakeCorpse(actor)
                         : Plugin.LodManager.TryAcquireForFallOrDeath(actor);
@@ -566,7 +588,7 @@ namespace DeliriumRavenfield.Patches
             }
         }
 
-        // 8. Projectile.Travel -> lightweight near-miss flinch detection for nearby alive bots
+        // 8. Projectile.Travel -> lightweight near-miss flinch detection for nearby standing alive bots
         [HarmonyPatch(typeof(Projectile), "Travel")]
         private static class Patch_Projectile_Travel
         {
@@ -578,6 +600,8 @@ namespace DeliriumRavenfield.Patches
                 if (__result || __instance == null || Plugin.LodManager == null) return;
                 var cfg = Plugin.ConfigInstance;
                 if (!cfg.Enabled.Value || !cfg.EnableNearMissFlinch.Value) return;
+                // Don't pull unshot bots into ragdoll if global muscle strength is too low to stay standing
+                if (cfg.MuscleStrength.Value < 0.65f) return;
 
                 var cam = Camera.main;
                 if (cam == null) return;
@@ -597,17 +621,24 @@ namespace DeliriumRavenfield.Patches
                 int projTeam = __instance.killCredit != null
                     ? __instance.killCredit.team
                     : (OwnerTeamField != null ? (int)OwnerTeamField.GetValue(__instance) : -1);
+                if (projTeam < 0) return;
 
                 float radius = cfg.NearMissRadius.Value;
                 float radiusSqr = radius * radius;
                 float now = Time.time;
+                const int worldMask = 1 << 0;
 
                 for (int i = 0; i < am.actors.Count; i++)
                 {
                     var actor = am.actors[i];
                     if (actor == null || actor.dead || actor.fallenOver || actor.IsSeated() || actor == am.player)
                         continue;
-                    if (projTeam >= 0 && actor.team == projTeam)
+                    if (actor.team == projTeam)
+                        continue;
+                    // Only flinch standing, non-sprinting bots (crouching/proning/sprinting bots pulled into ragdoll trip & collapse!)
+                    if (actor.stance != Actor.Stance.Stand)
+                        continue;
+                    if (actor.Velocity().sqrMagnitude > 2.2f * 2.2f)
                         continue;
                     // Don't interrupt wounded/crawling/surrendering bots with near-miss stagger takeover
                     if (Plugin.LodManager.TryGetHealthState(actor, out var hs) && hs.IsWounded)
@@ -624,7 +655,10 @@ namespace DeliriumRavenfield.Patches
                     Vector3 closest = start + dir * proj;
                     if ((targetPos - closest).sqrMagnitude <= radiusSqr)
                     {
-                        nearMissCooldown[actor] = now + 2.0f;
+                        // Ignore bullets passing on the far side of a wall or cover
+                        if (Physics.Linecast(closest, targetPos, worldMask, QueryTriggerInteraction.Ignore))
+                            continue;
+                        nearMissCooldown[actor] = now + 2.5f;
                         var ctrl = Plugin.LodManager.TryAcquireForLiveReaction(actor);
                         ctrl?.ApplyNearMiss(start, dir);
                     }

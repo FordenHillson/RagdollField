@@ -115,7 +115,6 @@ namespace DeliriumRavenfield.Core
         private float[] frameBuf;
         private readonly List<Rigidbody> kinematicBodies = new List<Rigidbody>();
         private readonly EnginePhysicsProxy enginePhysicsProxy = new EnginePhysicsProxy();
-        private readonly HomerVisualBody homerVisual = new HomerVisualBody();
 
         // State timers
         private float staggerElapsed;
@@ -308,20 +307,9 @@ namespace DeliriumRavenfield.Core
 
                 hips = rigBuild.Hips;
                 bones = rigBuild.Bones;
-                bool usePlayroomHomer = config.UsePlayroomHomerModel.Value && !IsPlayer;
-                if (usePlayroomHomer)
-                {
-                    if (rigBuild.Build != IntPtr.Zero) nm_build_destroy(rigBuild.Build);
-                    build = runtime.BaseBuild;
-                    buildOwnedByController = false;
-                    scale = 1f;
-                }
-                else
-                {
-                    build = rigBuild.Build;
-                    buildOwnedByController = true;
-                    scale = rigBuild.Scale;
-                }
+                build = rigBuild.Build;
+                buildOwnedByController = true;
+                scale = rigBuild.Scale;
                 LastRigReport = rigBuild.CheckReport ?? "";
                 LastRigSnapshot = rigBuild;
                 CachePartMasses();
@@ -338,28 +326,7 @@ namespace DeliriumRavenfield.Core
 
                 ApplyAgentConfig();
 
-                float[] restForRig = rigBuild.RestFrames;
-                if (usePlayroomHomer)
-                {
-                    restForRig = new float[rigBuild.RestFrames.Length];
-                    Array.Copy(rigBuild.RestFrames, restForRig, restForRig.Length);
-                    var p0 = new float[3];
-                    if (nm_agent_get_part_transform(Agent, 0, p0, null) >= 0)
-                    {
-                        int hipsBoneIdx = 0;
-                        for (int bi = 0; bi < rigBuild.Parts.Length; bi++)
-                            if (rigBuild.Parts[bi] == 0) { hipsBoneIdx = bi; break; }
-                        float dx = p0[0] - restForRig[hipsBoneIdx * 7 + 0];
-                        float dy = p0[1] - restForRig[hipsBoneIdx * 7 + 1];
-                        for (int bi = 0; bi < bones.Length; bi++)
-                        {
-                            restForRig[bi * 7 + 0] += dx;
-                            restForRig[bi * 7 + 1] += dy;
-                        }
-                    }
-                }
-
-                rig = nm_rig_create(Agent, bones.Length, rigBuild.Parents, restForRig, rigBuild.Parts);
+                rig = nm_rig_create(Agent, bones.Length, rigBuild.Parents, rigBuild.RestFrames, rigBuild.Parts);
                 if (rig == IntPtr.Zero)
                     throw new Exception($"nm_rig_create failed: {LastError()}");
 
@@ -377,15 +344,6 @@ namespace DeliriumRavenfield.Core
                 // 6. Seamless takeover from current Unity pose & velocity (zero snap!)
                 CaptureCurrentFrames(frameBuf);
                 Check(nm_rig_take(rig, Agent, frameBuf, null, 0f), "nm_rig_take");
-
-                if (usePlayroomHomer)
-                {
-                    homerVisual.Build(Actor, Agent, build, scale);
-                }
-                else
-                {
-                    homerVisual.Dispose();
-                }
 
                 // 6b. Build Delirium EnginePhysics kinematic colliders for Unity prop/trigger interaction
                 if (config.EnableEnginePhysicsColliders.Value)
@@ -1833,7 +1791,9 @@ namespace DeliriumRavenfield.Core
         {
             if (IsSyncLockstepControlled) return;
             if (Actor == null || Actor.dead || IsPlayer || Actor.IsSeated()) return;
-            if (Time.time - lastNearMissTime < 1.25f) return;
+            if (!IsSimulating && (Actor.stance != Actor.Stance.Stand || Actor.Velocity().sqrMagnitude > 2.5f * 2.5f))
+                return;
+            if (Time.time - lastNearMissTime < 2.0f) return;
             lastNearMissTime = Time.time;
 
             if (!EnsureTakenOver(startBalanced: true, alreadyFallen: false)) return;
@@ -2392,7 +2352,10 @@ namespace DeliriumRavenfield.Core
                 }
 
                 // Wait briefly (~0.35s) to settle onto the floor, then run rolled downed fight-back (supine/prone aim) OR natural writhing
-                if (!IsPlayer && fallenElapsed >= 0.35f && !blindFireActive)
+                // Skip injury-writhing for unhurt bots that merely tripped / fell without taking damage!
+                bool isHurtOrWounded = (HealthState != null && HealthState.IsWounded) ||
+                                       (Actor != null && Actor.health < Actor.maxHealth * 0.95f);
+                if (!IsPlayer && isHurtOrWounded && fallenElapsed >= 0.35f && !blindFireActive)
                 {
                     EnsureDownedBehaviorRolled(isIncapacitated: false);
                     bool testRangeIdle = Plugin.LodManager != null && Plugin.LodManager.TestRangeMode;
@@ -2689,11 +2652,7 @@ namespace DeliriumRavenfield.Core
                 {
                     Actor.hipRigidbody.transform.position = hipsWorldPos;
                 }
-                if (homerVisual.IsActive)
-                {
-                    homerVisual.SyncLateUpdate(Agent);
-                }
-                else if (Actor.skinnedRendererRagdoll != null && !Actor.skinnedRendererRagdoll.enabled)
+                if (Actor.skinnedRendererRagdoll != null && !Actor.skinnedRendererRagdoll.enabled)
                 {
                     Actor.skinnedRendererRagdoll.enabled = true;
                 }
@@ -2792,7 +2751,6 @@ namespace DeliriumRavenfield.Core
             }
 
             // Release Delirium native state and switch ActiveRaggy back to animated
-            homerVisual.Dispose();
             RestoreChestBaseScales();
             StopBlindFire(dropIfDead: false);
             ResetDownedFightBackState();
@@ -2895,7 +2853,6 @@ namespace DeliriumRavenfield.Core
             float groundY = runtime.SampleGroundHeight(hipPos + Vector3.up * 0.35f, Actor.transform, Actor.transform.position.y);
 
             // Release Delirium FIRST and restore non-kinematic rigidbodies with zero velocity
-            homerVisual.Dispose();
             RestoreChestBaseScales();
             if (activeFallenBehaviorActive)
             {
@@ -2963,7 +2920,6 @@ namespace DeliriumRavenfield.Core
         public void ReleaseDeadToVanillaPhysics()
         {
             Vector3 carryVel = lastComVel;
-            homerVisual.Dispose();
             CancelPhysicsGetUp(fallIfLow: false);
             RestoreChestBaseScales();
             ClearPartialKeyframe();
@@ -2990,7 +2946,6 @@ namespace DeliriumRavenfield.Core
             bool shouldWakeDeadRagdoll = Actor != null && (Actor.dead || Actor.fallenOver) &&
                                          Actor.ragdoll != null && Actor.ragdoll.IsRagdoll() &&
                                          Phase != RagdollPhase.DeadFrozen;
-            homerVisual.Dispose();
             CancelPhysicsGetUp(fallIfLow: false);
             RestoreChestBaseScales();
             ClearPartialKeyframe();

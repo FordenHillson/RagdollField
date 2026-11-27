@@ -65,7 +65,6 @@ namespace DeliriumRavenfield.Config
         public ConfigEntry<float> GetUpBlendSeconds { get; }
         public ConfigEntry<float> MaxStaggerTimeBeforeForceRecover { get; }
         public ConfigEntry<bool> EnablePureDeliriumGetUp { get; }
-        public ConfigEntry<bool> UsePlayroomHomerModel { get; }
 
         // [Environment]
         public ConfigEntry<bool> EnableVehicles { get; }
@@ -255,8 +254,6 @@ namespace DeliriumRavenfield.Config
                     new AcceptableValueRange<float>(1.5f, 10.0f)));
             EnablePureDeliriumGetUp = cfg.Bind("StaggerAndGetUp", "EnablePureDeliriumGetUp", false,
                 "Experimental: use Delirium's procedural physics get-up instead of Ravenfield's hand-animated push-off-floor Actor.GetUp animation (off by default for natural hands-on-floor get-up).");
-            UsePlayroomHomerModel = cfg.Bind("Skeleton", "UsePlayroomHomerModel", true,
-                "Replace AI bots' ragdoll physics rig and visual mesh with Playroom's exact 21-part Homer model + rig (homer-own.json) while Delirium simulates them.");
 
             EnableVehicles = cfg.Bind("Environment", "EnableVehicles", true,
                 "Sync moving Ravenfield vehicles to Delirium for pre-impact bracing and realistic vehicle hits.");
